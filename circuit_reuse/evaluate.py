@@ -58,8 +58,15 @@ def _extract_gold_ids(model: Any, prompt: str, target: str, device, verbose: boo
 	return [int(x) for x in gold_ids]
 
 
+# Simple caches to avoid repeated tokenization per example
+_BOOL_CACHE = {}
+_MC_CACHE = {}
+
 def _boolean_token_id_groups(model) -> Tuple[set, set]:
-	"""Collect single-token ids for (true,false) across common spacing/casing variants."""
+	"""Collect single-token ids for (true,false) across common spacing/casing variants (cached per model)."""
+	cache_key = id(model)
+	if cache_key in _BOOL_CACHE:
+		return _BOOL_CACHE[cache_key]
 	variants_true = [" true", "true", " True", "True"]
 	variants_false = [" false", "false", " False", "False"]
 	def collect(variants):
@@ -74,7 +81,9 @@ def _boolean_token_id_groups(model) -> Tuple[set, set]:
 			except Exception:
 				pass
 		return out
-	return collect(variants_true), collect(variants_false)
+	res = (collect(variants_true), collect(variants_false))
+	_BOOL_CACHE[cache_key] = res
+	return res
 
 
 def _classify_boolean(logits_last: Any, model, verbose: bool = False) -> Tuple[str, dict]:
@@ -97,38 +106,148 @@ def _classify_boolean(logits_last: Any, model, verbose: bool = False) -> Tuple[s
 	return label, id_logits
 
 
-def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], verbose: bool = False) -> float:
+def _mc_letter_token_id_groups(model) -> dict:
+	"""Collect possible single-token ids for letters A-D across spacing variants (cached per model)."""
+	cache_key = id(model)
+	if cache_key in _MC_CACHE:
+		return _MC_CACHE[cache_key]
+	letters = "ABCD"
+	variants = lambda L: [L, f" {L}", f"\n{L}"]
+	out = {}
+	for L in letters:
+		ids = set()
+		for v in variants(L):
+			try:
+				toks = model.to_tokens(v, prepend_bos=False)
+				seq = toks[0].tolist() if hasattr(toks, "tolist") else toks
+				if isinstance(seq[0], list): seq = seq[0]
+				if len(seq) == 1:
+					ids.add(int(seq[0]))
+			except Exception:
+				pass
+		out[L] = ids
+	_MC_CACHE[cache_key] = out
+	return out
+
+
+def _classify_multiple_choice(logits_last: Any, model, verbose: bool = False) -> str:
+	"""Select letter A-D with highest logit (max over variant token ids)."""
+	groups = _mc_letter_token_id_groups(model)
+	best_letter = "A"
+	best_score = float("-inf")
+	for L, id_set in groups.items():
+		if not id_set:
+			continue
+		score = max(float(logits_last[tid].item()) for tid in id_set)
+		if score > best_score:
+			best_score = score
+			best_letter = L
+	if verbose:
+		print(f"[MC-CLASSIFY] scores=" + ", ".join(
+			f"{L}:{'none' if not ids else max(logits_last[i].item() for i in ids):.3f}" for L, ids in groups.items()
+		))
+	return best_letter
+
+
+def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: str, verbose: bool = False) -> float:
+	# Ensure inference mode (no gradients)
+	if hasattr(model, "eval"): model.eval()
 	correct = 0
 	total = 0
+	if torch is not None:
+		# Use a single no_grad scope for full evaluation
+		with torch.no_grad():
+			for ex in dataset:
+				prompt_tokens = model.to_tokens(ex.prompt, prepend_bos=True)
+				target_tokens = model.to_tokens(ex.target, prepend_bos=False)
+				if not _is_tensorlike(target_tokens):
+					# mock path unchanged
+					pred_id = _predict_next_token_mock(model, ex.prompt)
+					gold_id = model.to_single_token(ex.target) if hasattr(model, "to_single_token") else pred_id
+					ok = pred_id == gold_id
+					if verbose:
+						print(f"[GREEDY][MOCK] prompt='{ex.prompt}' target='{ex.target}' pred_id={pred_id} gold_id={gold_id} correct={ok}")
+					correct += int(ok); total += 1; continue
+				if torch is None:
+					raise RuntimeError("PyTorch required for real model evaluation.")
+				device = getattr(model.cfg, "device", "cpu")
+				if hasattr(prompt_tokens, "to"):
+					prompt_tokens = prompt_tokens.to(device)
+
+				# --- Task-specific branches ---
+				if task == "boolean":
+					logits = model(prompt_tokens)
+					logits_last = logits[0, -1]
+					pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
+					ok = (pred_label == ex.target.lower())
+					if verbose:
+						print(f"[BOOLEAN] target='{ex.target}' pred='{pred_label}' correct={ok}")
+					correct += int(ok); total += 1; continue
+
+				if task == "mmlu" or task.startswith("mib_"):
+					logits = model(prompt_tokens)
+					logits_last = logits[0, -1]
+					pred_letter = _classify_multiple_choice(logits_last, model, verbose=verbose)
+					ok = (pred_letter == ex.target)
+					if verbose:
+						print(f"[MC] target='{ex.target}' pred='{pred_letter}' correct={ok}")
+					correct += int(ok); total += 1; continue
+
+				# --- Default autoregressive path (e.g., addition) ---
+				gold_ids = _extract_gold_ids(model, ex.prompt, ex.target, device, verbose=verbose)
+				current = prompt_tokens
+				generated: List[int] = []
+				all_match = True
+				for gid in gold_ids:
+					logits = model(current)
+					pred_id = int(logits[0, -1].argmax(dim=-1).item())
+					generated.append(pred_id)
+					next_tok = torch.tensor([[pred_id]], device=current.device)
+					current = torch.cat([current, next_tok], dim=1)
+					if pred_id != gid:
+						all_match = False
+				if verbose:
+					try:
+						gold_decoded = model.to_string(torch.tensor([gold_ids], device=current.device))
+						pred_decoded = model.to_string(torch.tensor([generated], device=current.device))
+					except Exception:
+						gold_decoded = "".join(str(t) for t in gold_ids)
+						pred_decoded = "".join(str(t) for t in generated)
+					print(f"[AR] target='{ex.target}' gold={gold_ids} gen={generated} correct={all_match} gold_text='{gold_decoded}' pred_text='{pred_decoded}'")
+				correct += int(all_match); total += 1
+		return correct / total if total else 0.0
+	# Fallback path (torch None): original loop (unchanged)
 	for ex in dataset:
 		prompt_tokens = model.to_tokens(ex.prompt, prepend_bos=True)
 		target_tokens = model.to_tokens(ex.target, prepend_bos=False)
 		if not _is_tensorlike(target_tokens):
+			# mock path unchanged
 			pred_id = _predict_next_token_mock(model, ex.prompt)
 			gold_id = model.to_single_token(ex.target) if hasattr(model, "to_single_token") else pred_id
 			ok = pred_id == gold_id
 			if verbose:
 				print(f"[GREEDY][MOCK] prompt='{ex.prompt}' target='{ex.target}' pred_id={pred_id} gold_id={gold_id} correct={ok}")
-			correct += int(ok)
-			total += 1
-			continue
-		if torch is None:
-			raise RuntimeError("PyTorch required for real model evaluation.")
-		device = getattr(model.cfg, "device", "cpu")
-		if hasattr(prompt_tokens, "to"):
-			prompt_tokens = prompt_tokens.to(device)
-		# --- Boolean classification shortcut ---
-		if ex.target.lower() in ("true", "false"):
+			correct += int(ok); total += 1; continue
+		# --- Task-specific branches ---
+		if task == "boolean":
 			logits = model(prompt_tokens)
 			logits_last = logits[0, -1]
 			pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
 			ok = (pred_label == ex.target.lower())
 			if verbose:
-				print(f"[GREEDY-BOOL] prompt='{ex.prompt}' target='{ex.target}' pred='{pred_label}' correct={ok}")
-			correct += int(ok)
-			total += 1
-			continue
-		# --- Standard autoregressive path ---
+				print(f"[BOOLEAN] target='{ex.target}' pred='{pred_label}' correct={ok}")
+			correct += int(ok); total += 1; continue
+
+		if task == "mmlu" or task.startswith("mib_"):
+			logits = model(prompt_tokens)
+			logits_last = logits[0, -1]
+			pred_letter = _classify_multiple_choice(logits_last, model, verbose=verbose)
+			ok = (pred_letter == ex.target)
+			if verbose:
+				print(f"[MC] target='{ex.target}' pred='{pred_letter}' correct={ok}")
+			correct += int(ok); total += 1; continue
+
+		# --- Default autoregressive path (e.g., addition) ---
 		gold_ids = _extract_gold_ids(model, ex.prompt, ex.target, device, verbose=verbose)
 		current = prompt_tokens
 		generated: List[int] = []
@@ -148,29 +267,14 @@ def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], verbose:
 			except Exception:
 				gold_decoded = "".join(str(t) for t in gold_ids)
 				pred_decoded = "".join(str(t) for t in generated)
-			print(
-				f"[GREEDY] prompt='{ex.prompt}' target='{ex.target}' "
-				f"gold={gold_ids} gen={generated} correct={all_match} "
-				f"gold_text='{gold_decoded}' pred_text='{pred_decoded}'"
-			)
-		correct += int(all_match)
-		total += 1
+			print(f"[AR] target='{ex.target}' gold={gold_ids} gen={generated} correct={all_match} gold_text='{gold_decoded}' pred_text='{pred_decoded}'")
+		correct += int(all_match); total += 1
 	return correct / total if total else 0.0
 
 
-def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExample], removed: Iterable[Component], verbose: bool = False) -> float:
-	"""Greedy exact-sequence accuracy with specified components zeroed.
-
-	Parameters
-	----------
-	model : Any
-	dataset : Iterable[ArithmeticExample]
-	removed : Iterable[Component]
-		Components to zero.
-	verbose : bool
-		If True, print per-example predictions (mirrors evaluate_accuracy).
-	"""
-	# Build zeroing hooks (real model path only)
+def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False) -> float:
+	"""Evaluate accuracy under component knockout for a specified task."""
+	if hasattr(model, "eval"): model.eval()
 	hooks: List[Tuple[str, callable]] = []
 	for comp in removed:
 		if comp.kind == "head":
@@ -178,15 +282,15 @@ def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExam
 			head_idx = comp.index
 			def make_zero_head_hook(idx: int):
 				def hook(act, hook=None):
-					act = act.clone()
-					act[:, :, idx, :] = 0
+					# In-place zeroing (avoid clone allocation)
+					act[:, :, idx, :].zero_()
 					return act
 				return hook
 			hooks.append((name, make_zero_head_hook(head_idx)))
 		elif comp.kind == "mlp":
 			name = f"blocks.{comp.layer}.hook_mlp_out"
 			def zero_mlp_hook(act, hook=None):
-				return torch.zeros_like(act)
+				return act.zero_()
 			hooks.append((name, zero_mlp_hook))
 		else:
 			raise ValueError(f"Unknown component type: {comp.kind}")
@@ -194,61 +298,60 @@ def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExam
 	correct = 0
 	total = 0
 	device = getattr(getattr(model, "cfg", object()), "device", "cpu")
-	with model.hooks(hooks):
-		for ex in dataset:
-			prompt_tokens = model.to_tokens(ex.prompt, prepend_bos=True)
-			target_tokens = model.to_tokens(ex.target, prepend_bos=False)
-			if not _is_tensorlike(target_tokens):
-				pred_id = _predict_next_token_mock(model, ex.prompt)
-				gold_id = model.to_single_token(ex.target) if hasattr(model, "to_single_token") else pred_id
-				ok = pred_id == gold_id
-				if verbose:
-					print(f"[KNOCKOUT][MOCK] prompt='{ex.prompt}' target='{ex.target}' pred_id={pred_id} gold_id={gold_id} correct={ok}")
-				correct += int(ok)
-				total += 1
-				continue
-			if torch is None:
-				raise RuntimeError("PyTorch required for knockout on real model.")
-			if hasattr(prompt_tokens, "to"):
-				prompt_tokens = prompt_tokens.to(device)
-			# --- Boolean classification shortcut (knockout) ---
-			if ex.target.lower() in ("true", "false"):
-				logits = model(prompt_tokens)
-				logits_last = logits[0, -1]
-				pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
-				ok = (pred_label == ex.target.lower())
-				if verbose:
-					print(f"[KNOCKOUT-BOOL] prompt='{ex.prompt}' target='{ex.target}' pred='{pred_label}' correct={ok}")
-				correct += int(ok)
-				total += 1
-				continue
-			# --- Standard autoregressive path ---
-			gold_ids = _extract_gold_ids(model, ex.prompt, ex.target, device, verbose=verbose)
-			current = prompt_tokens
-			generated: List[int] = []
-			all_match = True
-			for gid in gold_ids:
-				logits = model(current)
-				pred_id = int(logits[0, -1].argmax(dim=-1).item())
-				generated.append(pred_id)
-				next_tok = torch.tensor([[pred_id]], device=current.device)
-				current = torch.cat([current, next_tok], dim=1)
-				if pred_id != gid:
-					all_match = False
-			if verbose:
-				try:
-					gold_decoded = model.to_string(torch.tensor([gold_ids], device=current.device))
-					pred_decoded = model.to_string(torch.tensor([generated], device=current.device))
-				except Exception:
-					gold_decoded = "".join(str(t) for t in gold_ids)
-					pred_decoded = "".join(str(t) for t in generated)
-				print(
-					f"[KNOCKOUT] prompt='{ex.prompt}' target='{ex.target}' "
-					f"gold={gold_ids} gen={generated} correct={all_match} "
-					f"gold_text='{gold_decoded}' pred_text='{pred_decoded}'"
-				)
-			correct += int(all_match)
-			total += 1
+	if torch is not None:
+		with torch.no_grad():
+			with model.hooks(hooks):
+				for ex in dataset:
+					prompt_tokens = model.to_tokens(ex.prompt, prepend_bos=True)
+					target_tokens = model.to_tokens(ex.target, prepend_bos=False)
+					if not _is_tensorlike(target_tokens):
+						pred_id = _predict_next_token_mock(model, ex.prompt)
+						gold_id = model.to_single_token(ex.target) if hasattr(model, "to_single_token") else pred_id
+						ok = pred_id == gold_id
+						if verbose:
+							print(f"[KNOCKOUT][MOCK] prompt='{ex.prompt}' target='{ex.target}' pred_id={pred_id} gold_id={gold_id} correct={ok}")
+						correct += int(ok); total += 1; continue
+					if hasattr(prompt_tokens, "to"):
+						prompt_tokens = prompt_tokens.to(device)
+					if task == "boolean":
+						logits = model(prompt_tokens)
+						logits_last = logits[0, -1]
+						pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
+						ok = (pred_label == ex.target.lower())
+						if verbose:
+							print(f"[KNOCKOUT-BOOLEAN] target='{ex.target}' pred='{pred_label}' correct={ok}")
+						correct += int(ok); total += 1; continue
+					if task == "mmlu" or task.startswith("mib_"):
+						logits = model(prompt_tokens)
+						logits_last = logits[0, -1]
+						pred_letter = _classify_multiple_choice(logits_last, model, verbose=verbose)
+						ok = (pred_letter == ex.target)
+						if verbose:
+							print(f"[KNOCKOUT-MC] target='{ex.target}' pred='{pred_letter}' correct={ok}")
+						correct += int(ok); total += 1; continue
+					gold_ids = _extract_gold_ids(model, ex.prompt, ex.target, device, verbose=verbose)
+					current = prompt_tokens
+					generated: List[int] = []
+					all_match = True
+					for gid in gold_ids:
+						logits = model(current)
+						pred_id = int(logits[0, -1].argmax(dim=-1).item())
+						generated.append(pred_id)
+						next_tok = torch.tensor([[pred_id]], device=current.device)
+						current = torch.cat([current, next_tok], dim=1)
+						if pred_id != gid:
+							all_match = False
+					if verbose:
+						try:
+							gold_decoded = model.to_string(torch.tensor([gold_ids], device=current.device))
+							pred_decoded = model.to_string(torch.tensor([generated], device=current.device))
+						except Exception:
+							gold_decoded = "".join(str(t) for t in gold_ids)
+							pred_decoded = "".join(str(t) for t in generated)
+						print(f"[KNOCKOUT-AR] target='{ex.target}' gold={gold_ids} gen={generated} correct={all_match}")
+					correct += int(all_match); total += 1
+		return correct / total if total else 0.0
+	# Non-torch fallback unchanged
 	return correct / total if total else 0.0
 
 __all__ = ["evaluate_accuracy", "evaluate_accuracy_with_knockout"]

@@ -79,10 +79,18 @@ class MMLUDataset:
 		for i, item in enumerate(ds):
 			q = item["question"]
 			choices = item["choices"]
-			ans = item["answer"]
-			parts = [f"({chr(ord('A') + idx)}) {c}" for idx, c in enumerate(choices)]
-			prompt = f"{q} " + " ".join(parts)
-			self._examples.append(ArithmeticExample(prompt, str(ans)))
+			ans_idx = item["answer"]
+			# Reformatted prompt with standard structure and explicit Answer: cue
+			prompt = (
+				f"{q}\n"
+				f"A. {choices[0]}\n"
+				f"B. {choices[1]}\n"
+				f"C. {choices[2]}\n"
+				f"D. {choices[3]}\n"
+				f"Answer: "  # added trailing space
+			)
+			target = chr(ord('A') + ans_idx)
+			self._examples.append(ArithmeticExample(prompt, target))
 			if num_examples is not None and i + 1 >= num_examples:
 				break
 

@@ -7,6 +7,7 @@ from typing import List
 import json
 from pathlib import Path
 from datetime import datetime
+from contextlib import nullcontext  # added
 
 import torch
 from transformer_lens import HookedTransformer
@@ -89,9 +90,11 @@ def _run_single_combination(
 
     circuits: List[set] = []
     start = time.time()
-    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if amp and device.startswith("cuda")
-                    else torch.nullcontext())
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if amp and device.startswith("cuda")
+        else nullcontext()  # replaced torch.nullcontext()
+    )
     for idx, example in enumerate(dataset):
         with autocast_ctx:
             if method == "gradient":
@@ -110,8 +113,8 @@ def _run_single_combination(
     shared = compute_shared_circuit(circuits)
     print(f"[{task}] Shared circuit size={len(shared)} (top_k per example={top_k}).")
 
-    baseline_acc = evaluate_accuracy(model, dataset, verbose=debug)
-    knockout_acc = evaluate_accuracy_with_knockout(model, dataset, shared, verbose=debug)
+    baseline_acc = evaluate_accuracy(model, dataset, task=task, verbose=debug)
+    knockout_acc = evaluate_accuracy_with_knockout(model, dataset, task=task, removed=shared, verbose=debug)
 
     metrics = {
         "model_name": model_name,

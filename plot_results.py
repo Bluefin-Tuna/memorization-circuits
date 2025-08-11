@@ -2,8 +2,8 @@
 """
 Aggregate and plot experiment metrics produced by run_experiment.py.
 
-For each attribution method, produce a clean horizontal grouped bar plot:
-Baseline vs Knockout accuracy across tasks (one PNG per method) with Δ annotations.
+Produces one grouped bar plot per attribution method: baseline vs knockout accuracy
+with value labels on each bar (no diff annotations, no forced colors).
 """
 from __future__ import annotations
 import argparse
@@ -35,20 +35,21 @@ def parse_args() -> argparse.Namespace:
                    help="Display accuracies as percentage (0-100%). (Default: True)")
     p.add_argument("--overlay-scores", action="store_true",
                    help="Overlay baseline and post-removal accuracies as connected markers above bars.")
-    p.add_argument("--palette", type=str, default="#377eb8",
-                   help="Bar color (hex or seaborn palette name). Default: #377eb8")
+    # NOTE: --percent kept for backward compatibility (defaults to True behavior).
+    # Add --raw to disable percentage scaling.
+    p.add_argument("--raw", action="store_true",
+                   help="Show raw accuracies (0-1). Overrides --percent default.")
     return p.parse_args()
 
 
 def discover_metrics(results_dir: Path) -> List[Path]:
+    # REPLACED: now recursive to handle results/slurm_<job>/<combo>/metrics.json
     paths: List[Path] = []
     if not results_dir.exists():
         return paths
-    for child in results_dir.iterdir():
-        if child.is_dir():
-            m = child / "metrics.json"
-            if m.is_file():
-                paths.append(m)
+    for m in results_dir.rglob("metrics.json"):
+        # Skip plotting directories' own metrics if any future additions
+        paths.append(m)
     return sorted(paths)
 
 
@@ -56,7 +57,9 @@ def load_metrics_json(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r") as f:
             data = json.load(f)
-        data["_run_dir"] = path.parent.name
+        # Store relative run directory (two levels up possible)
+        data["_run_dir"] = str(path.parent.relative_to(path.parents[2])) if len(path.parents) >= 3 else path.parent.name
+        data["_run_path"] = str(path.parent)
         return data
     except Exception as e:
         print(f"[WARN] Failed to load {path}: {e}")
@@ -83,14 +86,12 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
 
 
 def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
-             percent: bool, overlay_scores: bool, palette: str):
+             percent: bool, overlay_scores: bool):
     if df.empty:
         print("[INFO] No data to plot.")
         return
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Use default matplotlib style (do not apply seaborn theme)
 
-    # Aggregate strictly by (task, method)
     grouped = (df
                .groupby(["task","method"], as_index=False)
                .agg(
@@ -103,7 +104,6 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
        (df[["task","method"]].drop_duplicates().shape[0] != grouped.shape[0]):
         print("[INFO] Aggregation averaged over varying top_k / model_name.")
 
-    # Create one bar chart per method
     methods = grouped["method"].unique()
     saved_files: list[str] = []
 
@@ -124,17 +124,50 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         after = sub.knockout_accuracy_mean.values * (100 if percent else 1)
         n_tasks = len(tasks)
         x = np.arange(n_tasks)
-        width = 0.38
+        width = 0.40
         fig_w = max(6.0, 0.8 * n_tasks + 1.5)
         fig_h = 4.3
         fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        ax.bar(x - width/2, baseline, width, label=f"Baseline ({method})")
-        ax.bar(x + width/2, after, width, label=f"After Removal ({method})")
+
+        bars1 = ax.bar(x - width/2, baseline, width, label="Baseline")
+        bars2 = ax.bar(x + width/2, after, width, label="Knockout")
+
+        # Dynamic y-limit
+        max_val = float(np.max([baseline.max() if len(baseline) else 0,
+                                after.max() if len(after) else 0, 0]))
+        if max_val == 0:
+            y_top = 1 if not percent else 5
+        else:
+            margin = 2 if percent else 0.02
+            y_top = max_val + margin
+            if percent:
+                y_top = min(100, y_top if y_top > max_val else max_val + 2)
+        ax.set_ylim(0, y_top)
+
+        # Value annotations (each bar)
+        def _annotate(bar_container, values):
+            for rect, val in zip(bar_container, values):
+                h = rect.get_height()
+                if percent:
+                    label = f"{val:.1f}"
+                    offset = 0.6
+                else:
+                    label = f"{val:.3f}"
+                    offset = 0.01
+                ax.text(rect.get_x() + rect.get_width()/2,
+                        h + offset,
+                        label,
+                        ha="center", va="bottom", fontsize=8)
+
+        _annotate(bars1, baseline)
+        _annotate(bars2, after)
+
         ax.set_xticks(x)
-        ax.set_xticklabels(tasks, rotation=25 if n_tasks > 6 or any(len(t)>10 for t in tasks) else 0, ha='right' if n_tasks > 6 else 'center')
+        ax.set_xticklabels(tasks,
+                           rotation=25 if n_tasks > 6 or any(len(t) > 10 for t in tasks) else 0,
+                           ha='right' if n_tasks > 6 else 'center')
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
         ax.set_xlabel("Task")
-        ax.set_ylim(0, 100 if percent else 1.0)
         ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False)
         fig.tight_layout()
         suffix = 'pct' if percent else 'raw'
@@ -156,8 +189,10 @@ def main():
     if not metrics_paths:
         print(f"[INFO] No metrics.json files found under {results_dir}")
     else:
-        print(f"[INFO] Found {len(metrics_paths)} metrics.json files.")
+        print(f"[INFO] Found {len(metrics_paths)} metrics.json files (recursive).")
     df = aggregate(metrics_paths)
+    # Determine percent flag (raw overrides)
+    percent = not args.raw
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_dir) if args.output_dir else results_dir / f"plots_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -171,9 +206,8 @@ def main():
         df, out_dir,
         show=args.show,
         sort_by=args.sort_by,
-        percent=args.percent,
+        percent=percent,
         overlay_scores=args.overlay_scores,
-        palette=args.palette,
     )
 
 
