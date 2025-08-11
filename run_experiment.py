@@ -7,12 +7,11 @@ from typing import List
 import json
 from pathlib import Path
 from datetime import datetime
-from itertools import product
 
 import torch
 from transformer_lens import HookedTransformer
 
-from circuit_reuse.dataset import AdditionDataset, ArithmeticExample, get_dataset
+from circuit_reuse.dataset import AdditionDataset, get_dataset
 from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit
 from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_knockout
 
@@ -31,82 +30,28 @@ def _prepare_run_dir(output_dir: str, run_name: str | None):
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI args."""
-    parser = argparse.ArgumentParser(description="Circuit reuse experiment")
-    # ORIGINAL single-value args (kept for backward compatibility)
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        required=True,
-        help="Name of the pretrained model to load (TransformerLens)",
-    )
-    parser.add_argument(
-        "--task",
-        type=str,
-        default="addition",
-        help="Single task (legacy arg). Ignored if --tasks provided.",
-    )
-    parser.add_argument(
-        "--num_examples",
-        type=int,
-        default=100,
-        help="Single number of examples (legacy). Ignored if --num_examples_list provided.",
-    )
-    parser.add_argument(
-        "--digits",
-        type=int,
-        default=2,
-        help="Digits for addition (legacy). Ignored if --digits_list provided.",
-    )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=5,
-        help="Components per circuit (legacy). Ignored if --top_ks provided.",
-    )
-    parser.add_argument(
-        "--method",
-        type=str,
-        default="gradient",
-        choices=["gradient", "ig"],
-        help="Attribution method (legacy). Ignored if --methods provided.",
-    )
-
-    # NEW plural list args for multi-run mode
-    parser.add_argument("--model_names", nargs="*", type=str,
-                        help="List of model names. Overrides --model_name if provided.")
-    parser.add_argument("--tasks", nargs="*", type=str,
-                        help="List of tasks. Overrides --task.")
-    parser.add_argument("--num_examples_list", nargs="*", type=int,
-                        help="List of num_examples values. Overrides --num_examples.")
-    parser.add_argument("--digits_list", nargs="*", type=int,
-                        help="List of digit counts for addition. Overrides --digits.")
-    parser.add_argument("--top_ks", nargs="*", type=int,
-                        help="List of top_k values. Overrides --top_k.")
-    parser.add_argument("--methods", nargs="*", type=str, choices=["gradient", "ig"],
-                        help="List of attribution methods. Overrides --method.")
-
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=5,
-        help="Number of interpolation steps for integrated gradients",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Computation device (cuda or cpu)",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable verbose per-example logging (predictions, components).",
-    )
-    parser.add_argument("--output-dir", type=str, default="results",
-                        help="Root directory to store experiment outputs.")
-    parser.add_argument("--run-name", type=str, default=None,
-                        help="Optional explicit run name; default is timestamp.")
+    """Parse CLI args (modern multi-run only)."""
+    parser = argparse.ArgumentParser(description="Circuit reuse experiment (multi-run only)")
+    # ONLY list-based args now
+    parser.add_argument("--model_names", nargs="+", type=str, required=True,
+                        help="List of model names.")
+    parser.add_argument("--tasks", nargs="+", type=str, required=True,
+                        help="List of tasks.")
+    parser.add_argument("--num_examples_list", nargs="+", type=int, required=True,
+                        help="List of num_examples values.")
+    parser.add_argument("--digits_list", nargs="+", type=int, required=True,
+                        help="List of digit counts (used only for addition).")
+    parser.add_argument("--top_ks", nargs="+", type=int, required=True,
+                        help="List of top_k values.")
+    parser.add_argument("--methods", nargs="+", type=str, choices=["gradient", "ig"], required=True,
+                        help="List of attribution methods.")
+    parser.add_argument("--steps", type=int, default=5,
+                        help="Interpolation steps for integrated gradients.")
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--output-dir", type=str, default="results")
+    parser.add_argument("--run-name", type=str, default=None)
     return parser.parse_args()
 
 
@@ -115,7 +60,7 @@ def _run_single_combination(
     model_name: str,
     task: str,
     num_examples: int,
-    digits: int,
+    digits: int | None,
     top_k: int,
     method: str,
     steps: int,
@@ -126,10 +71,10 @@ def _run_single_combination(
     """Execute one (model, task, num_examples, digits, top_k, method) combo and write outputs into run_dir."""
     # DATASET
     if task == "addition":
-        dataset = AdditionDataset(num_examples=num_examples, digits=digits)
+        dataset = AdditionDataset(num_examples=num_examples, digits=digits if digits is not None else 2)
         print(f"[{model_name}/{task}] Generated {len(dataset)} examples (digits={digits}).")
     else:
-        dataset = get_dataset(task, num_examples=num_examples, digits=digits)
+        dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
         print(f"[{model_name}/{task}] Loaded {len(dataset)} examples.")
 
     extractor = CircuitExtractor(model, top_k=top_k)
@@ -206,69 +151,67 @@ def main() -> None:
     """Run experiment end-to-end (single or multi-run)."""
     args = parse_args()
 
-    # Resolve lists (fallback to legacy single-value args)
-    model_names = args.model_names if args.model_names else [args.model_name]
-    tasks = args.tasks if args.tasks else [args.task]
-    methods = args.methods if args.methods else [args.method]
-    top_ks = args.top_ks if args.top_ks else [args.top_k]
-    digits_list = args.digits_list if args.digits_list else [args.digits]
-    num_examples_list = args.num_examples_list if args.num_examples_list else [args.num_examples]
-
-    multi_mode = any(len(lst) > 1 for lst in [model_names, tasks, methods, top_ks, digits_list, num_examples_list])
-
-    # Base directory (single run uses this directly; multi-run uses subdirs)
     base_run_dir = _prepare_run_dir(args.output_dir, args.run_name)
 
-    print(f"Models: {model_names}")
-    print(f"Tasks: {tasks}")
-    print(f"Methods: {methods}")
-    print(f"top_ks: {top_ks}")
-    print(f"digits_list: {digits_list}")
-    print(f"num_examples_list: {num_examples_list}")
-    print(f"Multi-run mode: {multi_mode}")
+    print(f"Models: {args.model_names}")
+    print(f"Tasks: {args.tasks}")
+    print(f"Methods: {args.methods}")
+    print(f"top_ks: {args.top_ks}")
+    print(f"digits_list: {args.digits_list}")
+    print(f"num_examples_list: {args.num_examples_list}")
 
-    total_runs = len(model_names) * len(tasks) * len(methods) * len(top_ks) * len(digits_list) * len(num_examples_list)
+    total_runs = 0
+    for task in args.tasks:
+        if task == "addition":
+            total_runs += (len(args.model_names) * len(args.methods) *
+                           len(args.top_ks) * len(args.digits_list) * len(args.num_examples_list))
+        else:
+            total_runs += (len(args.model_names) * len(args.methods) *
+                           len(args.top_ks) * 1 * len(args.num_examples_list))
     run_counter = 0
 
-    for model_name in model_names:
+    for model_name in args.model_names:
         print(f"[MODEL LOAD] Loading model {model_name} on {args.device}...")
         model: HookedTransformer = HookedTransformer.from_pretrained(model_name)
-        model.to(args.device)
-        model.eval()
+        model.to(args.device).eval()
 
-        for (task, method, top_k, digits, num_examples) in product(tasks, methods, top_ks, digits_list, num_examples_list):
-            run_counter += 1
-            combo_name = f"{model_name}__{task}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}__{method}"
-            if multi_mode:
-                run_dir = base_run_dir / combo_name
-            else:
-                # Legacy single-run: reuse base directory (no nesting)
-                run_dir = base_run_dir
-            print(f"\n[RUN {run_counter}/{total_runs}] {combo_name}")
-            try:
-                _run_single_combination(
-                    model=model,
-                    model_name=model_name,
-                    task=task,
-                    num_examples=num_examples,
-                    digits=digits,
-                    top_k=top_k,
-                    method=method,
-                    steps=args.steps,
-                    device=args.device,
-                    debug=args.debug,
-                    run_dir=run_dir,
-                )
-            except torch.cuda.OutOfMemoryError as oom:
-                print(f"[OOM] Skipping {combo_name}: {oom}")
-            except Exception as e:
-                print(f"[ERROR] {combo_name} failed: {e}")
-            finally:
-                # Clear gradients & cache between combos
-                model.zero_grad(set_to_none=True)
-                torch.cuda.empty_cache()
+        for task in args.tasks:
+            digits_iter = args.digits_list if task == "addition" else [None]
+            for method in args.methods:
+                for top_k in args.top_ks:
+                    for digits in digits_iter:
+                        for num_examples in args.num_examples_list:
+                            run_counter += 1
+                            combo_name = (
+                                f"{model_name}__{task}"
+                                f"__n{num_examples}"
+                                f"__d{digits if task=='addition' else 'na'}"
+                                f"__k{top_k}__{method}"
+                            )
+                            run_dir = base_run_dir / combo_name
+                            print(f"\n[RUN {run_counter}/{total_runs}] {combo_name}")
+                            try:
+                                _run_single_combination(
+                                    model=model,
+                                    model_name=model_name,
+                                    task=task,
+                                    num_examples=num_examples,
+                                    digits=digits,
+                                    top_k=top_k,
+                                    method=method,
+                                    steps=args.steps,
+                                    device=args.device,
+                                    debug=args.debug,
+                                    run_dir=run_dir,
+                                )
+                            except torch.cuda.OutOfMemoryError as oom:
+                                print(f"[OOM] Skipping {combo_name}: {oom}")
+                            except Exception as e:
+                                print(f"[ERROR] {combo_name} failed: {e}")
+                            finally:
+                                model.zero_grad(set_to_none=True)
+                                torch.cuda.empty_cache()
 
-        # Optionally free model before next one
         del model
         torch.cuda.empty_cache()
 
