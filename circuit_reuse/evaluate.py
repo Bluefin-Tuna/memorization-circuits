@@ -272,8 +272,8 @@ def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: st
 	return correct / total if total else 0.0
 
 
-def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False) -> float:
-	"""Evaluate accuracy under component knockout for a specified task."""
+def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False) -> float:
+	"""Evaluate accuracy under component ablation for a specified task."""
 	if hasattr(model, "eval"): model.eval()
 	hooks: List[Tuple[str, callable]] = []
 	for comp in removed:
@@ -282,7 +282,6 @@ def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExam
 			head_idx = comp.index
 			def make_zero_head_hook(idx: int):
 				def hook(act, hook=None):
-					# In-place zeroing (avoid clone allocation)
 					act[:, :, idx, :].zero_()
 					return act
 				return hook
@@ -309,7 +308,7 @@ def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExam
 						gold_id = model.to_single_token(ex.target) if hasattr(model, "to_single_token") else pred_id
 						ok = pred_id == gold_id
 						if verbose:
-							print(f"[KNOCKOUT][MOCK] prompt='{ex.prompt}' target='{ex.target}' pred_id={pred_id} gold_id={gold_id} correct={ok}")
+							print(f"[ABLATION][MOCK] prompt='{ex.prompt}' target='{ex.target}' pred_id={pred_id} gold_id={gold_id} correct={ok}")
 						correct += int(ok); total += 1; continue
 					if hasattr(prompt_tokens, "to"):
 						prompt_tokens = prompt_tokens.to(device)
@@ -319,7 +318,7 @@ def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExam
 						pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
 						ok = (pred_label == ex.target.lower())
 						if verbose:
-							print(f"[KNOCKOUT-BOOLEAN] target='{ex.target}' pred='{pred_label}' correct={ok}")
+							print(f"[ABLATION-BOOLEAN] target='{ex.target}' pred='{pred_label}' correct={ok}")
 						correct += int(ok); total += 1; continue
 					if task == "mmlu" or task.startswith("mib_"):
 						logits = model(prompt_tokens)
@@ -327,7 +326,7 @@ def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExam
 						pred_letter = _classify_multiple_choice(logits_last, model, verbose=verbose)
 						ok = (pred_letter == ex.target)
 						if verbose:
-							print(f"[KNOCKOUT-MC] target='{ex.target}' pred='{pred_letter}' correct={ok}")
+							print(f"[ABLATION-MC] target='{ex.target}' pred='{pred_letter}' correct={ok}")
 						correct += int(ok); total += 1; continue
 					gold_ids = _extract_gold_ids(model, ex.prompt, ex.target, device, verbose=verbose)
 					current = prompt_tokens
@@ -348,10 +347,10 @@ def evaluate_accuracy_with_knockout(model: Any, dataset: Iterable[ArithmeticExam
 						except Exception:
 							gold_decoded = "".join(str(t) for t in gold_ids)
 							pred_decoded = "".join(str(t) for t in generated)
-						print(f"[KNOCKOUT-AR] target='{ex.target}' gold={gold_ids} gen={generated} correct={all_match}")
+						print(f"[ABLATION-AR] target='{ex.target}' gold={gold_ids} gen={generated} correct={all_match}")
 					correct += int(all_match); total += 1
 		return correct / total if total else 0.0
-	# Non-torch fallback unchanged
+	# Non-torch fallback unchanged (would remain zero if reached)
 	return correct / total if total else 0.0
 
-__all__ = ["evaluate_accuracy", "evaluate_accuracy_with_knockout"]
+__all__ = ["evaluate_accuracy", "evaluate_accuracy_with_ablation"]

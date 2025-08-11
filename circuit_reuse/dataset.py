@@ -87,7 +87,7 @@ class MMLUDataset:
 				f"B. {choices[1]}\n"
 				f"C. {choices[2]}\n"
 				f"D. {choices[3]}\n"
-				f"Answer: "  # added trailing space
+				f"Answer: "
 			)
 			target = chr(ord('A') + ans_idx)
 			self._examples.append(ArithmeticExample(prompt, target))
@@ -138,6 +138,46 @@ class MIBDatasetHF:
 	def __iter__(self) -> Iterable[ArithmeticExample]:
 		return iter(self._examples)
 
+DATASET_DISPLAY_NAMES: dict[str, str] = {
+	"addition": "Addition",
+	"boolean": "Boolean",
+	"mmlu": "MMLU",
+}
+
+MODEL_DISPLAY_NAMES: dict[str, str] = {
+	"qwen3-0.6b": "Qwen3-0.6B",
+	"qwen3-1.7b": "Qwen3-1.7B",
+}
+
+def get_task_display_name(task: str) -> str:
+	if task in DATASET_DISPLAY_NAMES:
+		return DATASET_DISPLAY_NAMES[task]
+	if task.startswith("mib_"):
+		suffix = task[len("mib_"):].replace("_", " ").title()
+		return f"MIB: {suffix}"
+	return task.replace("_", " ").title()
+
+
+def get_model_display_name(model: str) -> str:
+	"""
+	Human-friendly model name:
+	1. Use explicit mapping if present.
+	2. Fallback: title-case first segment, uppercase trailing 'b' cap (e.g. x-1.7b -> X 1.7B).
+	"""
+	if model in MODEL_DISPLAY_NAMES:
+		return MODEL_DISPLAY_NAMES[model]
+	parts = model.split('-')
+	if not parts:
+		return model
+	first = parts[0].title()
+	rest = []
+	for p in parts[1:]:
+		if p.endswith('b') and p[:-1].replace('.', '').isdigit():
+			rest.append(p[:-1] + p[-1].upper())
+		else:
+			rest.append(p)
+	return " ".join([first] + rest)
+
 
 def get_dataset(task: str, num_examples: int = 100, digits: int = 2) -> Iterable[ArithmeticExample]:
 	if task == "addition":
@@ -157,4 +197,6 @@ __all__ = [
 	"MMLUDataset",
 	"MIBDatasetHF",
 	"get_dataset",
+	"get_task_display_name",
+	"get_model_display_name",
 ]

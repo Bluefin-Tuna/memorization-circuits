@@ -7,14 +7,14 @@ from typing import List
 import json
 from pathlib import Path
 from datetime import datetime
-from contextlib import nullcontext  # added
+from contextlib import nullcontext
 
 import torch
 from transformer_lens import HookedTransformer
 
 from circuit_reuse.dataset import AdditionDataset, get_dataset
 from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit
-from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_knockout
+from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_ablation
 
 
 def _default_run_name():
@@ -93,7 +93,7 @@ def _run_single_combination(
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if amp and device.startswith("cuda")
-        else nullcontext()  # replaced torch.nullcontext()
+        else nullcontext()
     )
     for idx, example in enumerate(dataset):
         with autocast_ctx:
@@ -114,7 +114,7 @@ def _run_single_combination(
     print(f"[{task}] Shared circuit size={len(shared)} (top_k per example={top_k}).")
 
     baseline_acc = evaluate_accuracy(model, dataset, task=task, verbose=debug)
-    knockout_acc = evaluate_accuracy_with_knockout(model, dataset, task=task, removed=shared, verbose=debug)
+    knockout_acc = evaluate_accuracy_with_ablation(model, dataset, task=task, removed=shared, verbose=debug)
 
     metrics = {
         "model_name": model_name,
@@ -125,7 +125,7 @@ def _run_single_combination(
         "method": method,
         "ig_steps": steps if method == "ig" else None,
         "baseline_accuracy": baseline_acc,
-        "knockout_accuracy": knockout_acc,
+        "ablation_accuracy": knockout_acc,
         "accuracy_drop": baseline_acc - knockout_acc,
         "shared_circuit_size": len(shared),
         "shared_circuit_components": [

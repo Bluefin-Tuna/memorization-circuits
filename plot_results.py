@@ -2,8 +2,8 @@
 """
 Aggregate and plot experiment metrics produced by run_experiment.py.
 
-Produces one grouped bar plot per attribution method: baseline vs knockout accuracy
-with value labels on each bar (no diff annotations, no forced colors).
+Produces one grouped bar plot per attribution method: baseline vs ablation accuracy
+with value labels on each bar.
 """
 from __future__ import annotations
 import argparse
@@ -14,8 +14,16 @@ from typing import List, Dict, Any
 
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns  # still imported but not used for styling (kept to avoid removing dependency)
+import seaborn as sns
 import numpy as np
+from circuit_reuse.dataset import get_task_display_name, get_model_display_name
+
+
+# Method display names
+METHOD_DISPLAY = {
+    "gradient": "Gradient",
+    "ig": "Integrated Gradients",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,35 +37,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--show", action="store_true",
                    help="Show plots interactively (if a display is available).")
     p.add_argument("--sort-by", type=str, default="drop",
-                   choices=["drop","baseline","knockout","task"],
+                   choices=["drop", "baseline", "ablation", "task"],
                    help="Ordering of tasks within each plot.")
     p.add_argument("--percent", action="store_true", default=True,
                    help="Display accuracies as percentage (0-100%). (Default: True)")
     p.add_argument("--overlay-scores", action="store_true",
                    help="Overlay baseline and post-removal accuracies as connected markers above bars.")
-    # NOTE: --percent kept for backward compatibility (defaults to True behavior).
-    # Add --raw to disable percentage scaling.
     p.add_argument("--raw", action="store_true",
                    help="Show raw accuracies (0-1). Overrides --percent default.")
     return p.parse_args()
 
 
 def discover_metrics(results_dir: Path) -> List[Path]:
-    # REPLACED: now recursive to handle results/slurm_<job>/<combo>/metrics.json
-    paths: List[Path] = []
     if not results_dir.exists():
-        return paths
-    for m in results_dir.rglob("metrics.json"):
-        # Skip plotting directories' own metrics if any future additions
-        paths.append(m)
-    return sorted(paths)
+        return []
+    return sorted(results_dir.rglob("metrics.json"))
 
 
 def load_metrics_json(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r") as f:
             data = json.load(f)
-        # Store relative run directory (two levels up possible)
         data["_run_dir"] = str(path.parent.relative_to(path.parents[2])) if len(path.parents) >= 3 else path.parent.name
         data["_run_path"] = str(path.parent)
         return data
@@ -67,17 +67,13 @@ def load_metrics_json(path: Path) -> Dict[str, Any]:
 
 
 def aggregate(paths: List[Path]) -> pd.DataFrame:
-    rows = []
-    for p in paths:
-        d = load_metrics_json(p)
-        if d:
-            rows.append(d)
+    rows = [d for p in paths if (d := load_metrics_json(p))]
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     numeric_cols = [
-        "baseline_accuracy","knockout_accuracy","accuracy_drop","top_k",
-        "shared_circuit_size","extraction_seconds","num_examples","digits","ig_steps"
+        "baseline_accuracy", "ablation_accuracy", "accuracy_drop", "top_k",
+        "shared_circuit_size", "extraction_seconds", "num_examples", "digits", "ig_steps"
     ]
     for c in numeric_cols:
         if c in df.columns:
@@ -90,93 +86,92 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
     if df.empty:
         print("[INFO] No data to plot.")
         return
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     grouped = (df
-               .groupby(["task","method"], as_index=False)
+               .groupby(["model_display", "task_display", "method"], as_index=False)
                .agg(
-                   baseline_accuracy_mean=("baseline_accuracy","mean"),
-                   knockout_accuracy_mean=("knockout_accuracy","mean"),
-                   accuracy_drop_mean=("accuracy_drop","mean"),
-                   runs=("baseline_accuracy","count")
+                   baseline_accuracy_mean=("baseline_accuracy", "mean"),
+                   ablation_accuracy_mean=("ablation_accuracy", "mean"),
+                   accuracy_drop_mean=("accuracy_drop", "mean"),
+                   runs=("baseline_accuracy", "count")
                ))
-    if {"top_k","model_name"}.intersection(df.columns) and \
-       (df[["task","method"]].drop_duplicates().shape[0] != grouped.shape[0]):
+    if {"top_k", "model_name"}.intersection(df.columns) and \
+       (df[["model_name", "task", "method"]].drop_duplicates().shape[0] != grouped.shape[0]):
         print("[INFO] Aggregation averaged over varying top_k / model_name.")
 
     methods = grouped["method"].unique()
-    saved_files: list[str] = []
+    saved_files: list[str] = []g
+
+    sns.set_theme(style="ticks", context="talk", palette="colorblind")
+    plt.rcParams.update({"font.family": "serif"})
 
     for method in methods:
-        sub = grouped[grouped["method"] == method].copy()
+        method_subset = grouped[grouped["method"] == method]
+        for model_disp in sorted(method_subset.model_display.unique()):
+            sub = method_subset[method_subset.model_display == model_disp].copy()
 
-        if sort_by == "drop":
-            sub = sub.sort_values("accuracy_drop_mean", ascending=False)
-        elif sort_by == "baseline":
-            sub = sub.sort_values("baseline_accuracy_mean", ascending=False)
-        elif sort_by == "knockout":
-            sub = sub.sort_values("knockout_accuracy_mean", ascending=False)
-        else:
-            sub = sub.sort_values("task")
+            if sort_by == "drop":
+                sub = sub.sort_values("accuracy_drop_mean", ascending=False)
+            elif sort_by == "baseline":
+                sub = sub.sort_values("baseline_accuracy_mean", ascending=False)
+            elif sort_by == "ablation":
+                sub = sub.sort_values("ablation_accuracy_mean", ascending=False)
+            else:
+                sub = sub.sort_values("task_display")
 
-        tasks = list(sub.task)
-        baseline = sub.baseline_accuracy_mean.values * (100 if percent else 1)
-        after = sub.knockout_accuracy_mean.values * (100 if percent else 1)
-        n_tasks = len(tasks)
-        x = np.arange(n_tasks)
-        width = 0.40
-        fig_w = max(6.0, 0.8 * n_tasks + 1.5)
-        fig_h = 4.3
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            tasks = list(sub.task_display)
+            baseline = sub.baseline_accuracy_mean.values * (100 if percent else 1)
+            after = sub.ablation_accuracy_mean.values * (100 if percent else 1)
+            n_tasks = len(tasks)
+            x = np.arange(n_tasks)
+            width = 0.40
 
-        bars1 = ax.bar(x - width/2, baseline, width, label="Baseline")
-        bars2 = ax.bar(x + width/2, after, width, label="Knockout")
+            fig_w = max(8.0, 1.2 * n_tasks + 2.5)
+            fig_h = 6.0
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-        # Dynamic y-limit
-        max_val = float(np.max([baseline.max() if len(baseline) else 0,
-                                after.max() if len(after) else 0, 0]))
-        if max_val == 0:
-            y_top = 1 if not percent else 5
-        else:
-            margin = 2 if percent else 0.02
-            y_top = max_val + margin
+            bars1 = ax.bar(x - width/2, baseline, width, label="Baseline")
+            bars2 = ax.bar(x + width/2, after, width, label="Ablated")
+
+            ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
             if percent:
-                y_top = min(100, y_top if y_top > max_val else max_val + 2)
-        ax.set_ylim(0, y_top)
+                ax.set_ylim(0, 105)
+            else:
+                max_val = float(np.max([baseline.max() if len(baseline) else 0,
+                                        after.max() if len(after) else 0]))
+                ax.set_ylim(0, max_val * 1.08 if max_val > 0 else 1)
 
-        # Value annotations (each bar)
-        def _annotate(bar_container, values):
-            for rect, val in zip(bar_container, values):
-                h = rect.get_height()
-                if percent:
-                    label = f"{val:.1f}"
-                    offset = 0.6
-                else:
-                    label = f"{val:.3f}"
-                    offset = 0.01
-                ax.text(rect.get_x() + rect.get_width()/2,
-                        h + offset,
-                        label,
-                        ha="center", va="bottom", fontsize=8)
+            def _annotate(bar_container, values):
+                for rect, val in zip(bar_container, values):
+                    h = rect.get_height()
+                    label = f"{val:.1f}" if percent else f"{val:.3f}"
+                    ax.annotate(label,
+                                xy=(rect.get_x() + rect.get_width() / 2, h),
+                                xytext=(0, 2.0),
+                                textcoords="offset points",
+                                ha='center', va='bottom', fontsize=11, zorder=5)
 
-        _annotate(bars1, baseline)
-        _annotate(bars2, after)
+            _annotate(bars1, baseline)
+            _annotate(bars2, after)
 
-        ax.set_xticks(x)
-        ax.set_xticklabels(tasks,
-                           rotation=25 if n_tasks > 6 or any(len(t) > 10 for t in tasks) else 0,
-                           ha='right' if n_tasks > 6 else 'center')
-        ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
-        ax.set_xlabel("Task")
-        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False)
-        fig.tight_layout()
-        suffix = 'pct' if percent else 'raw'
-        out_path = out_dir / f"accuracy_comparison_method_{method}_{suffix}.png"
-        plt.savefig(out_path, dpi=170, bbox_inches="tight")
-        saved_files.append(out_path.name)
-        if show:
-            plt.show()
-        plt.close()
+            ax.set_xlabel("Task")
+            ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
+            ax.set_xticks(x)
+            ax.set_xticklabels(tasks, rotation=0, ha='center')
+            ax.set_title(f"{model_disp} – {METHOD_DISPLAY.get(method, method.title())} Attribution")
+
+            ax.legend(loc='upper right', frameon=True)
+            fig.tight_layout()
+
+            suffix = 'pct' if percent else 'raw'
+            safe_model = model_disp.replace(" ", "_")
+            out_path = out_dir / f"{safe_model}_accuracy_{method}_{suffix}.png"
+            plt.savefig(out_path, dpi=200, bbox_inches="tight")
+            saved_files.append(out_path.name)
+
+            if show:
+                plt.show()
+            plt.close()
 
     print(f"[INFO] Plots written to: {out_dir}")
     print(f"[INFO] Files: {', '.join(saved_files)}")
@@ -186,22 +181,31 @@ def main():
     args = parse_args()
     results_dir = Path(args.results_dir)
     metrics_paths = discover_metrics(results_dir)
+    
     if not metrics_paths:
         print(f"[INFO] No metrics.json files found under {results_dir}")
-    else:
-        print(f"[INFO] Found {len(metrics_paths)} metrics.json files (recursive).")
+        return
+        
+    print(f"[INFO] Found {len(metrics_paths)} metrics.json files (recursive).")
     df = aggregate(metrics_paths)
-    # Determine percent flag (raw overrides)
+    
+    if df.empty:
+        print("[INFO] Empty DataFrame; skipping CSV and plots.")
+        return
+
     percent = not args.raw
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_dir) if args.output_dir else results_dir / f"plots_{timestamp}"
+    
     out_dir.mkdir(parents=True, exist_ok=True)
-    if not df.empty:
-        csv_path = out_dir / args.save_csv_name
-        df.to_csv(csv_path, index=False)
-        print(f"[INFO] Aggregated CSV saved to {csv_path}")
-    else:
-        print("[INFO] Empty DataFrame; skipping CSV and plots.")
+    
+    df["task_display"] = df["task"].apply(get_task_display_name)
+    df["model_display"] = df["model_name"].apply(get_model_display_name)
+    df["method_display"] = df["method"].map(METHOD_DISPLAY).fillna(df["method"].str.title())
+    csv_path = out_dir / args.save_csv_name
+    df.to_csv(csv_path, index=False)
+    print(f"[INFO] Aggregated CSV saved to {csv_path}")
+
     plot_all(
         df, out_dir,
         show=args.show,
