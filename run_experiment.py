@@ -4,6 +4,9 @@
 import argparse
 import time
 from typing import List
+import json
+from pathlib import Path
+from datetime import datetime
 
 import torch
 from transformer_lens import HookedTransformer
@@ -11,6 +14,19 @@ from transformer_lens import HookedTransformer
 from circuit_reuse.dataset import AdditionDataset, ArithmeticExample, get_dataset
 from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit
 from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_knockout
+
+
+def _default_run_name():
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+
+def _prepare_run_dir(output_dir: str, run_name: str | None):
+    base = Path(output_dir)
+    if run_name is None or run_name.strip() == "":
+        run_name = _default_run_name()
+    run_dir = base / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +96,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose per-example logging (predictions, components).",
     )
+    parser.add_argument("--output-dir", type=str, default="results",
+                        help="Root directory to store experiment outputs.")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Optional explicit run name; default is timestamp.")
     return parser.parse_args()
 
 
@@ -151,6 +171,40 @@ def main() -> None:
     print(
         f"Accuracy drop due to removing shared circuit: {baseline_acc - knockout_acc:.3f}"
     )
+
+    run_dir = _prepare_run_dir(args.output_dir, args.run_name)
+
+    # OPTIONAL: set up logging file (uncomment if desired)
+    # import logging, sys
+    # logging.basicConfig(
+    #     level=logging.INFO,
+    #     handlers=[
+    #         logging.StreamHandler(sys.stdout),
+    #         logging.FileHandler(run_dir / "stdout.log", mode="w")
+    #     ]
+    # )
+
+    # SAVE results
+    try:
+        metrics_path = run_dir / "metrics.json"
+        with metrics_path.open("w") as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"Failed to write metrics.json: {e}")
+
+    # SAVE config (args)
+    try:
+        config_path = run_dir / "config.json"
+        with config_path.open("w") as f:
+            json.dump(vars(args), f, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"Failed to write config.json: {e}")
+
+    # OPTIONAL: save model/artifacts if variables exist
+    # if 'model' in locals():
+    #     torch.save(model.state_dict(), run_dir / "model.pt")
+
+    print(f"Results saved to: {run_dir.resolve()}")
 
 
 if __name__ == "__main__":
