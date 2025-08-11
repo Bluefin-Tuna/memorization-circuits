@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+*.pot
+*.mo
+*.env
+.env*
+.venv/
+ENV/
+.envrc
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Slurm output
+*.out
+*.err
+*.slurm
+
+# Test cache
+.coverage
+htmlcov/
+.cache/
+
+# Others
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Ignore data and results folders if present
+data/
+results/

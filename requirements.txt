@@ -1,0 +1,7 @@
+torch>=2.1.0
+transformers>=4.35.0
+transformer-lens>=2.10.0
+tqdm>=4.64.0
+numpy>=1.23.0
+einops>=0.7.0
+datasets>=2.2.2
