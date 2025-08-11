@@ -52,6 +52,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results")
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--dtype", type=str, default="auto",
+                        choices=["auto", "bf16", "float16", "float32"],
+                        help="Model/load dtype to reduce memory (bf16 recommended).")
+    parser.add_argument("--log-mem", action="store_true",
+                        help="Print CUDA memory after each combo.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Use autocast (mixed precision) during extraction.")
     return parser.parse_args()
 
 
@@ -67,6 +74,7 @@ def _run_single_combination(
     device: str,
     debug: bool,
     run_dir: Path,
+    amp: bool,
 ):
     """Execute one (model, task, num_examples, digits, top_k, method) combo and write outputs into run_dir."""
     # DATASET
@@ -81,11 +89,15 @@ def _run_single_combination(
 
     circuits: List[set] = []
     start = time.time()
+    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if amp and device.startswith("cuda")
+                    else torch.nullcontext())
     for idx, example in enumerate(dataset):
-        if method == "gradient":
-            comp_set = extractor.extract_circuit(example.prompt, example.target)
-        else:
-            comp_set = extractor.extract_circuit_ig(example.prompt, example.target, steps=steps)
+        with autocast_ctx:
+            if method == "gradient":
+                comp_set = extractor.extract_circuit(example.prompt, example.target)
+            else:
+                comp_set = extractor.extract_circuit_ig(example.prompt, example.target, steps=steps)
         circuits.append(comp_set)
         if debug:
             print(f"[EXTRACT {task}] idx={idx} comps={len(comp_set)}")
@@ -160,6 +172,19 @@ def main() -> None:
     print(f"digits_list: {args.digits_list}")
     print(f"num_examples_list: {args.num_examples_list}")
 
+    dtype_map = {
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+
+    def _print_mem(prefix: str):
+        if not torch.cuda.is_available():
+            return
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"[MEM] {prefix} allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB")
+
     total_runs = 0
     for task in args.tasks:
         if task == "addition":
@@ -171,9 +196,13 @@ def main() -> None:
     run_counter = 0
 
     for model_name in args.model_names:
-        print(f"[MODEL LOAD] Loading model {model_name} on {args.device}...")
-        model: HookedTransformer = HookedTransformer.from_pretrained(model_name)
+        print(f"[MODEL LOAD] Loading model {model_name} (dtype={args.dtype}) on {args.device}...")
+        load_kwargs = {"trust_remote_code": True}
+        if args.dtype != "auto":
+            load_kwargs["dtype"] = dtype_map[args.dtype]
+        model: HookedTransformer = HookedTransformer.from_pretrained(model_name, **load_kwargs)
         model.to(args.device).eval()
+        _print_mem("post-load")
 
         for task in args.tasks:
             digits_iter = args.digits_list if task == "addition" else [None]
@@ -203,20 +232,31 @@ def main() -> None:
                                     device=args.device,
                                     debug=args.debug,
                                     run_dir=run_dir,
+                                    amp=args.amp,
                                 )
                             except torch.cuda.OutOfMemoryError as oom:
                                 print(f"[OOM] Skipping {combo_name}: {oom}")
                             except Exception as e:
                                 print(f"[ERROR] {combo_name} failed: {e}")
                             finally:
+                                # Release hooks/caches if present
+                                if hasattr(model, "reset_hooks"):
+                                    try: model.reset_hooks()
+                                    except Exception: pass
+                                if hasattr(model, "clear_contexts"):
+                                    try: model.clear_contexts()
+                                    except Exception: pass
                                 model.zero_grad(set_to_none=True)
                                 torch.cuda.empty_cache()
+                                if args.log_mem:
+                                    _print_mem(combo_name)
 
         del model
         torch.cuda.empty_cache()
+        if args.log_mem:
+            _print_mem("after-model-del")
 
     print(f"[ALL DONE] Completed {run_counter}/{total_runs} runs. Results root: {base_run_dir.resolve()}")
-
 
 if __name__ == "__main__":
     main()
