@@ -172,6 +172,24 @@ def main() -> None:
         f"Accuracy drop due to removing shared circuit: {baseline_acc - knockout_acc:.3f}"
     )
 
+    metrics = {
+        "model_name": args.model_name,
+        "task": args.task,
+        "num_examples": len(dataset),
+        "digits": args.digits if args.task == "addition" else None,
+        "top_k": args.top_k,
+        "method": args.method,
+        "ig_steps": args.steps if args.method == "ig" else None,
+        "baseline_accuracy": baseline_acc,
+        "knockout_accuracy": knockout_acc,
+        "accuracy_drop": baseline_acc - knockout_acc,
+        "shared_circuit_size": len(shared),
+        "shared_circuit_components": [
+            str(c) for c in sorted(shared, key=lambda c: (c.layer, c.kind, c.index))
+        ],
+        "extraction_seconds": end - start,
+    }
+
     run_dir = _prepare_run_dir(args.output_dir, args.run_name)
 
     # OPTIONAL: set up logging file (uncomment if desired)
