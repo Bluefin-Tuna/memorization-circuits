@@ -100,7 +100,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         print("[INFO] Aggregation averaged over varying top_k / model_name.")
 
     methods = grouped["method"].unique()
-    saved_files: list[str] = []g
+    saved_files: list[str] = []
 
     sns.set_theme(style="ticks", context="talk", palette="colorblind")
     plt.rcParams.update({"font.family": "serif"})
