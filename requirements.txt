@@ -5,3 +5,5 @@ tqdm>=4.64.0
 numpy>=1.23.0
 einops>=0.7.0
 datasets>=2.2.2
+matplotlib>=3.10.5
+seaborn>=0.13.2

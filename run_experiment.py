@@ -7,6 +7,7 @@ from typing import List
 import json
 from pathlib import Path
 from datetime import datetime
+from itertools import product
 
 import torch
 from transformer_lens import HookedTransformer
@@ -32,6 +33,7 @@ def _prepare_run_dir(output_dir: str, run_name: str | None):
 def parse_args() -> argparse.Namespace:
     """Parse CLI args."""
     parser = argparse.ArgumentParser(description="Circuit reuse experiment")
+    # ORIGINAL single-value args (kept for backward compatibility)
     parser.add_argument(
         "--model_name",
         type=str,
@@ -42,43 +44,48 @@ def parse_args() -> argparse.Namespace:
         "--task",
         type=str,
         default="addition",
-        help=(
-            "Task to evaluate. Built-in options include 'addition', 'boolean',\n"
-            "'mmlu' (toy subset), 'mmlu_real' (load an MMLU subject via the HuggingFace\n"
-            "Hub), 'general' (built-in general knowledge), or any dataset under\n"
-            "the 'mib' namespace by prefixing with 'mib_' (e.g. 'mib_ioi')."
-        ),
+        help="Single task (legacy arg). Ignored if --tasks provided.",
     )
     parser.add_argument(
         "--num_examples",
         type=int,
         default=100,
-        help=(
-            "Number of examples to evaluate. For built-in synthetic tasks this\n"
-            "controls how many random examples are generated. For HuggingFace\n"
-            "datasets (mmlu_real and mib_*), this limits how many examples\n"
-            "are loaded from the split."
-        ),
+        help="Single number of examples (legacy). Ignored if --num_examples_list provided.",
     )
     parser.add_argument(
         "--digits",
         type=int,
         default=2,
-        help="Number of digits in each operand (addition only)",
+        help="Digits for addition (legacy). Ignored if --digits_list provided.",
     )
     parser.add_argument(
         "--top_k",
         type=int,
         default=5,
-        help="Number of components to include in each circuit",
+        help="Components per circuit (legacy). Ignored if --top_ks provided.",
     )
     parser.add_argument(
         "--method",
         type=str,
         default="gradient",
         choices=["gradient", "ig"],
-        help="Attribution method: 'gradient' for single-step gradients or 'ig' for integrated gradients",
+        help="Attribution method (legacy). Ignored if --methods provided.",
     )
+
+    # NEW plural list args for multi-run mode
+    parser.add_argument("--model_names", nargs="*", type=str,
+                        help="List of model names. Overrides --model_name if provided.")
+    parser.add_argument("--tasks", nargs="*", type=str,
+                        help="List of tasks. Overrides --task.")
+    parser.add_argument("--num_examples_list", nargs="*", type=int,
+                        help="List of num_examples values. Overrides --num_examples.")
+    parser.add_argument("--digits_list", nargs="*", type=int,
+                        help="List of digit counts for addition. Overrides --digits.")
+    parser.add_argument("--top_ks", nargs="*", type=int,
+                        help="List of top_k values. Overrides --top_k.")
+    parser.add_argument("--methods", nargs="*", type=str, choices=["gradient", "ig"],
+                        help="List of attribution methods. Overrides --method.")
+
     parser.add_argument(
         "--steps",
         type=int,
@@ -103,83 +110,60 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    """Run experiment end-to-end."""
-    args = parse_args()
-    print(f"Loading model {args.model_name} on {args.device}...")
-    model: HookedTransformer = HookedTransformer.from_pretrained(args.model_name)
-    model.to(args.device)
-
-    # Create dataset via factory
-    if args.task == "addition":
-        dataset = AdditionDataset(num_examples=args.num_examples, digits=args.digits)
-        print(
-            f"Generated {len(dataset)} examples of {args.digits}-digit addition for evaluation."
-        )
+def _run_single_combination(
+    model: HookedTransformer,
+    model_name: str,
+    task: str,
+    num_examples: int,
+    digits: int,
+    top_k: int,
+    method: str,
+    steps: int,
+    device: str,
+    debug: bool,
+    run_dir: Path,
+):
+    """Execute one (model, task, num_examples, digits, top_k, method) combo and write outputs into run_dir."""
+    # DATASET
+    if task == "addition":
+        dataset = AdditionDataset(num_examples=num_examples, digits=digits)
+        print(f"[{model_name}/{task}] Generated {len(dataset)} examples (digits={digits}).")
     else:
-        # boolean and mmlu tasks ignore digits parameter (except addition)
-        dataset = get_dataset(args.task, num_examples=args.num_examples, digits=args.digits)
-        print(f"Loaded dataset for task '{args.task}' with {len(dataset)} examples.")
+        dataset = get_dataset(task, num_examples=num_examples, digits=digits)
+        print(f"[{model_name}/{task}] Loaded {len(dataset)} examples.")
 
-    # Create circuit extractor
-    extractor = CircuitExtractor(model, top_k=args.top_k)
+    extractor = CircuitExtractor(model, top_k=top_k)
 
-    # Extract circuits using the chosen attribution method
     circuits: List[set] = []
     start = time.time()
     for idx, example in enumerate(dataset):
-        if args.method == "gradient":
+        if method == "gradient":
             comp_set = extractor.extract_circuit(example.prompt, example.target)
         else:
-            # integrated gradients
-            comp_set = extractor.extract_circuit_ig(
-                example.prompt, example.target, steps=args.steps
-            )
+            comp_set = extractor.extract_circuit_ig(example.prompt, example.target, steps=steps)
         circuits.append(comp_set)
-        if args.debug:
-            print(f"[EXTRACT] idx={idx} prompt='{example.prompt}' target='{example.target}' components={sorted(comp_set, key=lambda c:(c.layer,c.kind,c.index))}")
+        if debug:
+            print(f"[EXTRACT {task}] idx={idx} comps={len(comp_set)}")
         if (idx + 1) % 10 == 0 or (idx + 1) == len(dataset):
-            print(
-                f"Processed {idx + 1}/{len(dataset)} examples (last circuit size: {len(comp_set)})"
-            )
+            print(f"[{task}] {idx + 1}/{len(dataset)} examples (last circuit size={len(comp_set)})")
+        # free intermediate grads right away
+        model.zero_grad(set_to_none=True)
     end = time.time()
-    method_name = "gradient" if args.method == "gradient" else f"integrated gradients ({args.steps} steps)"
-    print(f"Extraction via {method_name} completed in {end - start:.2f} seconds.")
 
-    # Compute shared circuit
     shared = compute_shared_circuit(circuits)
-    print(
-        f"Shared circuit contains {len(shared)} components out of {args.top_k} per example."
-    )
-    if shared:
-        for comp in sorted(shared, key=lambda c: (c.layer, c.kind, c.index)):
-            print(f"  {comp}")
-    else:
-        print("No components are shared across all examples.")
+    print(f"[{task}] Shared circuit size={len(shared)} (top_k per example={top_k}).")
 
-    # Evaluate baseline accuracy
-    print("Evaluating baseline accuracy (exact sequence)...")
-    baseline_acc = evaluate_accuracy(model, dataset, verbose=args.debug)
-    print(f"Baseline accuracy: {baseline_acc:.3f}")
-    # (All auxiliary diagnostics removed for lean version.)
-
-    # Evaluate with shared circuit removed
-    print("Evaluating accuracy with shared circuit knocked out...")
-    knockout_acc = evaluate_accuracy_with_knockout(model, dataset, shared, verbose=args.debug)
-    print(f"Knockout accuracy: {knockout_acc:.3f}")
-
-    print(
-        f"Accuracy drop due to removing shared circuit: {baseline_acc - knockout_acc:.3f}"
-    )
+    baseline_acc = evaluate_accuracy(model, dataset, verbose=debug)
+    knockout_acc = evaluate_accuracy_with_knockout(model, dataset, shared, verbose=debug)
 
     metrics = {
-        "model_name": args.model_name,
-        "task": args.task,
+        "model_name": model_name,
+        "task": task,
         "num_examples": len(dataset),
-        "digits": args.digits if args.task == "addition" else None,
-        "top_k": args.top_k,
-        "method": args.method,
-        "ig_steps": args.steps if args.method == "ig" else None,
+        "digits": digits if task == "addition" else None,
+        "top_k": top_k,
+        "method": method,
+        "ig_steps": steps if method == "ig" else None,
         "baseline_accuracy": baseline_acc,
         "knockout_accuracy": knockout_acc,
         "accuracy_drop": baseline_acc - knockout_acc,
@@ -190,39 +174,105 @@ def main() -> None:
         "extraction_seconds": end - start,
     }
 
-    run_dir = _prepare_run_dir(args.output_dir, args.run_name)
-
-    # OPTIONAL: set up logging file (uncomment if desired)
-    # import logging, sys
-    # logging.basicConfig(
-    #     level=logging.INFO,
-    #     handlers=[
-    #         logging.StreamHandler(sys.stdout),
-    #         logging.FileHandler(run_dir / "stdout.log", mode="w")
-    #     ]
-    # )
-
-    # SAVE results
+    run_dir.mkdir(parents=True, exist_ok=True)
     try:
-        metrics_path = run_dir / "metrics.json"
-        with metrics_path.open("w") as f:
+        with (run_dir / "metrics.json").open("w") as f:
             json.dump(metrics, f, indent=2, sort_keys=True)
     except Exception as e:
-        print(f"Failed to write metrics.json: {e}")
+        print(f"[WARN] Failed to write metrics.json in {run_dir}: {e}")
 
-    # SAVE config (args)
     try:
-        config_path = run_dir / "config.json"
-        with config_path.open("w") as f:
-            json.dump(vars(args), f, indent=2, sort_keys=True)
+        config = {
+            "model_name": model_name,
+            "task": task,
+            "num_examples": num_examples,
+            "digits": digits,
+            "top_k": top_k,
+            "method": method,
+            "steps": steps,
+            "device": device,
+            "debug": debug,
+        }
+        with (run_dir / "config.json").open("w") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
     except Exception as e:
-        print(f"Failed to write config.json: {e}")
+        print(f"[WARN] Failed to write config.json in {run_dir}: {e}")
 
-    # OPTIONAL: save model/artifacts if variables exist
-    # if 'model' in locals():
-    #     torch.save(model.state_dict(), run_dir / "model.pt")
+    print(f"[DONE] {run_dir}")
+    return metrics
 
-    print(f"Results saved to: {run_dir.resolve()}")
+
+def main() -> None:
+    """Run experiment end-to-end (single or multi-run)."""
+    args = parse_args()
+
+    # Resolve lists (fallback to legacy single-value args)
+    model_names = args.model_names if args.model_names else [args.model_name]
+    tasks = args.tasks if args.tasks else [args.task]
+    methods = args.methods if args.methods else [args.method]
+    top_ks = args.top_ks if args.top_ks else [args.top_k]
+    digits_list = args.digits_list if args.digits_list else [args.digits]
+    num_examples_list = args.num_examples_list if args.num_examples_list else [args.num_examples]
+
+    multi_mode = any(len(lst) > 1 for lst in [model_names, tasks, methods, top_ks, digits_list, num_examples_list])
+
+    # Base directory (single run uses this directly; multi-run uses subdirs)
+    base_run_dir = _prepare_run_dir(args.output_dir, args.run_name)
+
+    print(f"Models: {model_names}")
+    print(f"Tasks: {tasks}")
+    print(f"Methods: {methods}")
+    print(f"top_ks: {top_ks}")
+    print(f"digits_list: {digits_list}")
+    print(f"num_examples_list: {num_examples_list}")
+    print(f"Multi-run mode: {multi_mode}")
+
+    total_runs = len(model_names) * len(tasks) * len(methods) * len(top_ks) * len(digits_list) * len(num_examples_list)
+    run_counter = 0
+
+    for model_name in model_names:
+        print(f"[MODEL LOAD] Loading model {model_name} on {args.device}...")
+        model: HookedTransformer = HookedTransformer.from_pretrained(model_name)
+        model.to(args.device)
+        model.eval()
+
+        for (task, method, top_k, digits, num_examples) in product(tasks, methods, top_ks, digits_list, num_examples_list):
+            run_counter += 1
+            combo_name = f"{model_name}__{task}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}__{method}"
+            if multi_mode:
+                run_dir = base_run_dir / combo_name
+            else:
+                # Legacy single-run: reuse base directory (no nesting)
+                run_dir = base_run_dir
+            print(f"\n[RUN {run_counter}/{total_runs}] {combo_name}")
+            try:
+                _run_single_combination(
+                    model=model,
+                    model_name=model_name,
+                    task=task,
+                    num_examples=num_examples,
+                    digits=digits,
+                    top_k=top_k,
+                    method=method,
+                    steps=args.steps,
+                    device=args.device,
+                    debug=args.debug,
+                    run_dir=run_dir,
+                )
+            except torch.cuda.OutOfMemoryError as oom:
+                print(f"[OOM] Skipping {combo_name}: {oom}")
+            except Exception as e:
+                print(f"[ERROR] {combo_name} failed: {e}")
+            finally:
+                # Clear gradients & cache between combos
+                model.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+
+        # Optionally free model before next one
+        del model
+        torch.cuda.empty_cache()
+
+    print(f"[ALL DONE] Completed {run_counter}/{total_runs} runs. Results root: {base_run_dir.resolve()}")
 
 
 if __name__ == "__main__":
