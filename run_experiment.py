@@ -172,13 +172,20 @@ def _run_single_combination(
     print(f"[{task}] Shared circuit size={len(shared)} (top_k per example={top_k}).")
 
     # Baseline and shared-circuit ablation metrics
-    baseline_train_acc = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
-    ablation_train_acc = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=shared, verbose=debug)
+    baseline_train_correct, baseline_train_total = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
+    baseline_train_acc = baseline_train_correct / baseline_train_total if baseline_train_total > 0 else 0.0
+    ablation_train_correct, ablation_train_total = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=shared, verbose=debug)
+    ablation_train_acc = ablation_train_correct / ablation_train_total if ablation_train_total > 0 else 0.0
+
     if val_examples:
-        baseline_val_acc = evaluate_accuracy(model, val_examples, task=task, verbose=debug)
-        ablation_val_acc = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=shared, verbose=debug)
+        baseline_val_correct, baseline_val_total = evaluate_accuracy(model, val_examples, task=task, verbose=debug)
+        baseline_val_acc = baseline_val_correct / baseline_val_total if baseline_val_total > 0 else 0.0
+        ablation_val_correct, ablation_val_total = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=shared, verbose=debug)
+        ablation_val_acc = ablation_val_correct / ablation_val_total if ablation_val_total > 0 else 0.0
     else:
+        baseline_val_correct, baseline_val_total = 0, 0
         baseline_val_acc = float('nan')
+        ablation_val_correct, ablation_val_total = 0, 0
         ablation_val_acc = float('nan')
 
     # CONTROL ABLATION: random components from the full set (heads + MLPs across all layers)
@@ -190,10 +197,13 @@ def _run_single_combination(
     control_removed = rng.sample(all_components, k) if k > 0 else []
     print(f"[{task}] Control ablation uses {len(control_removed)}/{len(all_components)} random components (seed={rng_seed}).")
 
-    control_train_acc = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=control_removed, verbose=debug)
+    control_train_correct, control_train_total = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=control_removed, verbose=debug)
+    control_train_acc = control_train_correct / control_train_total if control_train_total > 0 else 0.0
     if val_examples:
-        control_val_acc = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=control_removed, verbose=debug)
+        control_val_correct, control_val_total = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=control_removed, verbose=debug)
+        control_val_acc = control_val_correct / control_val_total if control_val_total > 0 else 0.0
     else:
+        control_val_correct, control_val_total = 0, 0
         control_val_acc = float('nan')
 
     metrics = {
@@ -204,10 +214,21 @@ def _run_single_combination(
         "top_k": top_k,
         "method": method,
         "ig_steps": steps if method == "ig" else None,
+
         "baseline_train_accuracy": baseline_train_acc,
+        "baseline_train_correct": baseline_train_correct,
+        "baseline_train_total": baseline_train_total,
         "ablation_train_accuracy": ablation_train_acc,
+        "ablation_train_correct": ablation_train_correct,
+        "ablation_train_total": ablation_train_total,
+
         "baseline_val_accuracy": baseline_val_acc,
+        "baseline_val_correct": baseline_val_correct,
+        "baseline_val_total": baseline_val_total,
         "ablation_val_accuracy": ablation_val_acc,
+        "ablation_val_correct": ablation_val_correct,
+        "ablation_val_total": ablation_val_total,
+
         "accuracy_drop_train": baseline_train_acc - ablation_train_acc,
         "accuracy_drop_val": (baseline_val_acc - ablation_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
         "accuracy_drop_train_val": baseline_train_acc - ablation_val_acc if not math.isnan(ablation_val_acc) else float('nan'),
@@ -220,7 +241,11 @@ def _run_single_combination(
 
         # Control ablation metrics
         "control_train_accuracy": control_train_acc,
+        "control_train_correct": control_train_correct,
+        "control_train_total": control_train_total,
         "control_val_accuracy": control_val_acc,
+        "control_val_correct": control_val_correct,
+        "control_val_total": control_val_total,
         "control_accuracy_drop_train": baseline_train_acc - control_train_acc,
         "control_accuracy_drop_val": (baseline_val_acc - control_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
         "control_accuracy_drop_train_val": baseline_train_acc - control_val_acc if not math.isnan(control_val_acc) else float('nan'),

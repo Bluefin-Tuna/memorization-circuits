@@ -9,6 +9,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+from scipy import stats
 from circuit_reuse.dataset import get_task_display_name, get_model_display_name
 
 # Method display names
@@ -38,6 +39,8 @@ def parse_args() -> argparse.Namespace:
                    help="If set, do not plot Control results.")
     p.add_argument("--raw", action="store_true",
                    help="Show raw accuracies (0-1). Overrides --percent default.")
+    p.add_argument("--ci", type=float, default=0.95,
+                   help="Confidence level for error bars (e.g., 0.95 for 95%% CI).")
     return p.parse_args()
 
 def discover_metrics(results_dir: Path) -> List[Path]:
@@ -68,31 +71,79 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
         "baseline_val_accuracy", "ablation_val_accuracy", "control_val_accuracy",
         "accuracy_drop_train", "accuracy_drop_val", "accuracy_drop_train_val",
         "control_accuracy_drop_train", "control_accuracy_drop_val", "control_accuracy_drop_train_val",
+        "baseline_train_correct", "baseline_train_total",
+        "ablation_train_correct", "ablation_train_total",
+        "control_train_correct", "control_train_total",
+        "baseline_val_correct", "baseline_val_total",
+        "ablation_val_correct", "ablation_val_total",
+        "control_val_correct", "control_val_total",
     ]
     for c in numeric_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
+def wilson_score_interval(p: float, n: int, z: float) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion."""
+    if n == 0 or p < 0 or p > 1:
+        return (0, 0)
+    # Wilson score interval calculation
+    p_z = p + z**2 / (2 * n)
+    term = z * np.sqrt((p * (1 - p)) / n + z**2 / (4 * n**2))
+    denominator = 1 + z**2 / n
+    lower = (p_z - term) / denominator
+    upper = (p_z + term) / denominator
+    # Return error bar sizes (distance from p)
+    return p - lower, upper - p
+
 def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
-             percent: bool, overlay_scores: bool, include_control: bool):
+             percent: bool, overlay_scores: bool, include_control: bool, ci_level: float):
     if df.empty:
         print("[INFO] No data to plot.")
         return
 
+    z_score = stats.norm.ppf((1 + ci_level) / 2)
+
+    agg_spec = {
+        "baseline_train_correct": ("baseline_train_correct", "sum"),
+        "baseline_train_total": ("baseline_train_total", "sum"),
+        "ablation_train_correct": ("ablation_train_correct", "sum"),
+        "ablation_train_total": ("ablation_train_total", "sum"),
+        "control_train_correct": ("control_train_correct", "sum"),
+        "control_train_total": ("control_train_total", "sum"),
+        "baseline_val_correct": ("baseline_val_correct", "sum"),
+        "baseline_val_total": ("baseline_val_total", "sum"),
+        "ablation_val_correct": ("ablation_val_correct", "sum"),
+        "ablation_val_total": ("ablation_val_total", "sum"),
+        "control_val_correct": ("control_val_correct", "sum"),
+        "control_val_total": ("control_val_total", "sum"),
+        "shared_circuit_size_mean": ("shared_circuit_size", "mean"),
+        "top_k_mean": ("top_k", "mean"),
+        "runs": ("baseline_train_accuracy", "count")
+    }
+    
+    final_agg_spec = {k: v for k, v in agg_spec.items() if v[0] in df.columns}
     grouped = (df
                .groupby(["model_display", "task_display", "method"], as_index=False)
-               .agg(
-                   baseline_train_accuracy_mean=("baseline_train_accuracy", "mean"),
-                   ablation_train_accuracy_mean=("ablation_train_accuracy", "mean"),
-                   control_train_accuracy_mean=("control_train_accuracy", "mean"),
-                   baseline_val_accuracy_mean=("baseline_val_accuracy", "mean"),
-                   ablation_val_accuracy_mean=("ablation_val_accuracy", "mean"),
-                   control_val_accuracy_mean=("control_val_accuracy", "mean"),
-                    shared_circuit_size_mean=("shared_circuit_size", "mean"),
-                    top_k_mean=("top_k", "mean"),
-                   runs=("baseline_train_accuracy", "count")
-               ))
+               .agg(**final_agg_spec))
+
+    # Calculate accuracies and CIs from aggregated sums
+    for split in ["train", "val"]:
+        for cat in ["baseline", "ablation", "control"]:
+            correct_col = f"{cat}_{split}_correct"
+            total_col = f"{cat}_{split}_total"
+            acc_col = f"{cat}_{split}_accuracy_mean"
+            err_col = f"{cat}_{split}_error"
+
+            if correct_col in grouped.columns and total_col in grouped.columns:
+                grouped[acc_col] = grouped[correct_col] / grouped[total_col].replace(0, np.nan)
+                errors = grouped.apply(
+                    lambda row: wilson_score_interval(row[acc_col], row[total_col], z_score),
+                    axis=1
+                )
+                # Store error tuple and then split into two columns for yerr
+                grouped[err_col] = list(errors)
+
     if {"top_k", "model_name"}.intersection(df.columns) and \
        (df[["model_name", "task", "method"]].drop_duplicates().shape[0] != grouped.shape[0]):
         print("[INFO] Aggregation averaged over varying top_k / model_name.")
@@ -130,17 +181,30 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         has_control = control_col is not None and (control_col in sub)
         ctrl_vals = sub[control_col].values * (100 if percent else 1) if has_control else None
         
+        base_err_col = baseline_col.replace("_mean", "_error")
+        abl_err_col = ablation_col.replace("_mean", "_error")
+        base_err = np.array(sub[base_err_col].tolist()) * (100 if percent else 1) if base_err_col in sub else None
+        abl_err = np.array(sub[abl_err_col].tolist()) * (100 if percent else 1) if abl_err_col in sub else None
+        
+        ctrl_err = None
+        if has_control:
+            ctrl_err_col = control_col.replace("_mean", "_error")
+            if ctrl_err_col in sub:
+                ctrl_err = np.array(sub[ctrl_err_col].tolist()) * (100 if percent else 1)
+
         n_tasks = len(tasks)
         x = np.arange(n_tasks)
         
         # Bars
         labels = ["Baseline", "Ablated"]
         value_arrays = [base_vals, abl_vals]
+        error_arrays = [base_err, abl_err]
         # replaced custom hex colors with palette colors
         colors = [base_palette[0], base_palette[1]]
         if has_control:
             labels.append(control_label)
             value_arrays.append(ctrl_vals)
+            error_arrays.append(ctrl_err)
             colors.append(base_palette[2])
 
         n_bars = len(labels)
@@ -153,14 +217,15 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
         bar_containers = []
-        for off, lab, vals, col in zip(offsets, labels, value_arrays, colors):
+        for off, lab, vals, err, col in zip(offsets, labels, value_arrays, error_arrays, colors):
             bc = ax.bar(
                 x + off,
                 vals,
                 bar_width * 0.95,
                 label=lab,
                 color=col,
-                # zorder=3,
+                yerr=err.T if err is not None else None,
+                capsize=3,
                 edgecolor='none',
                 linewidth=0
             )
@@ -361,6 +426,7 @@ def main():
         percent=percent,
         overlay_scores=args.overlay_scores,
         include_control=not args.no_control,
+        ci_level=args.ci,
     )
 
 if __name__ == "__main__":

@@ -120,8 +120,8 @@ def _classify_multiple_choice(logits_last: Any, model, verbose: bool = False) ->
         ))
     return best_letter
 
-def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: str, verbose: bool = False, mock: bool = False) -> float:
-    """Evaluate accuracy on a dataset for a given task."""
+def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: str, verbose: bool = False, mock: bool = False) -> Tuple[int, int]:
+    """Evaluate accuracy on a dataset for a given task. Returns (correct, total)."""
     if mock:
         correct = 0
         total = 0
@@ -131,7 +131,7 @@ def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: st
             if pred_id == gold_id:
                 correct += 1
             total += 1
-        return correct / total if total else 0.0
+        return correct, total
 
     model.eval()
     correct = 0
@@ -155,16 +155,17 @@ def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: st
                 if gold_ids and int(logits_last.argmax().item()) in gold_ids:
                     correct += 1
             total += 1
-    return correct / total if total else 0.0
+    return correct, total
 
-def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False, mock: bool = False) -> float:
-    """Evaluate accuracy under component ablation for a specified task."""
+def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False, mock: bool = False) -> Tuple[int, int]:
+    """Evaluate accuracy under component ablation for a specified task. Returns (correct, total)."""
     if mock:
         # For mock tests, ablation is a no-op, return perfect accuracy if no components removed.
+        total = len(list(dataset)) if hasattr(dataset, '__len__') else sum(1 for _ in dataset)
         if not removed:
-            return 1.0
+            return total, total
         # Simple mock logic: if any component is removed, assume accuracy drops to 0.
-        return 0.0
+        return 0, total
 
     model.eval()
     hooks: List[Tuple[str, callable]] = []
@@ -205,6 +206,6 @@ def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[ArithmeticExam
                 if gold_ids and int(logits_last.argmax().item()) in gold_ids:
                     correct += 1
             total += 1
-    return correct / total if total else 0.0
+    return correct, total
 
 __all__ = ["evaluate_accuracy", "evaluate_accuracy_with_ablation"]
