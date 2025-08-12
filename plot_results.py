@@ -62,10 +62,9 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
     numeric_cols = [
         "top_k", "shared_circuit_size", "extraction_seconds", 
         "num_examples", "digits", "ig_steps",
-        "baseline_train_accuracy", "ablation_train_accuracy", "ablation_control_train_accuracy",
-        "baseline_val_accuracy", "ablation_val_accuracy", "ablation_control_val_accuracy",
-        "accuracy_drop_train", "accuracy_drop_val", "accuracy_drop_train_val",
-        "accuracy_drop_train_control", "accuracy_drop_val_control", "accuracy_drop_train_val_control"
+        "baseline_train_accuracy", "ablation_train_accuracy",
+        "baseline_val_accuracy", "ablation_val_accuracy",
+        "accuracy_drop_train", "accuracy_drop_val", "accuracy_drop_train_val"
     ]
     for c in numeric_cols:
         if c in df.columns:
@@ -83,10 +82,8 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                .agg(
                    baseline_train_accuracy_mean=("baseline_train_accuracy", "mean"),
                    ablation_train_accuracy_mean=("ablation_train_accuracy", "mean"),
-                   ablation_control_train_accuracy_mean=("ablation_control_train_accuracy", "mean"),
                    baseline_val_accuracy_mean=("baseline_val_accuracy", "mean"),
                    ablation_val_accuracy_mean=("ablation_val_accuracy", "mean"),
-                   ablation_control_val_accuracy_mean=("ablation_control_val_accuracy", "mean"),
                    runs=("baseline_train_accuracy", "count")
                ))
     if {"top_k", "model_name"}.intersection(df.columns) and \
@@ -99,7 +96,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
     sns.set_theme(style="ticks", context="talk", palette="colorblind")
     plt.rcParams.update({"font.family": "serif"})
 
-    def _create_plot(sub, baseline_col, ablation_col, title_suffix, filename_suffix, *, control_col: str | None = None, control_label: str = "Control Ablated"):
+    def _create_plot(sub, baseline_col, ablation_col, title_suffix, filename_suffix):
         if sub.empty:
             return
         # Sorting
@@ -167,8 +164,8 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                             textcoords="offset points",
                             ha='center', va='bottom', fontsize=11, zorder=5)
         
-        for bc, vals in zip(bar_containers, value_arrays):
-            _annotate(bc, vals)
+        _annotate(bars1, base_vals)
+        _annotate(bars2, abl_vals)
         
         if overlay_scores:
             ax.plot(x, base_vals, marker='o', color='black', linewidth=1)
@@ -179,9 +176,9 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         ax.set_xticks(x)
         ax.set_xticklabels(tasks, rotation=0, ha='center')
         ax.set_title(title_suffix)
-        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.20), ncol=3 if (control_col and control_col in sub) else 2, frameon=True)
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.20), ncol=n_bars, frameon=True)
         fig.tight_layout(rect=[0, 0.05, 1, 1])
-
+        
         out_path = out_dir / filename_suffix
         plt.savefig(out_path, dpi=200, bbox_inches="tight")
         saved_files.append(out_path.name)
@@ -200,10 +197,8 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                 sub, 
                 "baseline_train_accuracy_mean", 
                 "ablation_train_accuracy_mean",
-                f"{model_disp} - {pretty_method} Train/Train (Includes Control)", 
-                f"{safe_model}_{method}_train_train.png",
-                control_col="ablation_control_train_accuracy_mean",
-                control_label="Random Control"
+                f"{model_disp} - {pretty_method} Train/Train", 
+                f"{safe_model}_{method}_train_train.png"
             )
             
             # Val/Val if available
@@ -212,10 +207,8 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                     sub, 
                     "baseline_val_accuracy_mean", 
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Val/Val (Includes Control)", 
-                    f"{safe_model}_{method}_val_val.png",
-                    control_col="ablation_control_val_accuracy_mean",
-                    control_label="Random Control"
+                    f"{model_disp} - {pretty_method} Val/Val", 
+                    f"{safe_model}_{method}_val_val.png"
                 )
             
             # Train/Val if available
@@ -234,23 +227,15 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                     "ablation_val_accuracy_mean": "ablation_val_mean"
                 }, inplace=True)
                 
-                # For Train/Val, also include control if available (train control + val control)
-                tv_full = sub[[
-                    "model_display", "task_display", "method",
-                    "baseline_train_accuracy_mean", "ablation_val_accuracy_mean",
-                    "ablation_control_val_accuracy_mean"
-                ]].copy()
                 _create_plot(
-                    tv_full.rename(columns={
-                        "baseline_train_accuracy_mean": "baseline_train_accuracy_mean", 
-                        "ablation_val_accuracy_mean": "ablation_val_accuracy_mean"
+                    tv.rename(columns={
+                        "baseline_train_mean": "baseline_train_accuracy_mean", 
+                        "ablation_val_mean": "ablation_val_accuracy_mean"
                     }), 
                     "baseline_train_accuracy_mean", 
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Train/Val (Includes Control)", 
-                    f"{safe_model}_{method}_train_val.png",
-                    control_col="ablation_control_val_accuracy_mean",
-                    control_label="Random Control"
+                    f"{model_disp} - {pretty_method} Train/Val", 
+                    f"{safe_model}_{method}_train_val.png"
                 )
 
     print(f"[INFO] Plots written to: {out_dir}")
