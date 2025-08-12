@@ -96,53 +96,56 @@ class CircuitExtractor:
 		return {c for c,_ in items}
 
 	def extract_circuit_ig(self, prompt: str, target: str, baseline_prompt: Optional[str] = None, steps: int = 5) -> Set[Component]:
+		"""Integrated gradients style circuit extraction.
+
+		Interpolate embeddings between a baseline (zeros or baseline_prompt) and the real prompt.
+		Accumulate gradient*activation scores for heads & MLPs across steps and average.
+		Falls back to single-step gradient method when steps < 2.
+		"""
 		if steps < 2:
 			return self.extract_circuit(prompt, target)
+
 		device = self.model.cfg.device
 		prompt_tokens = self.model.to_tokens(prompt, prepend_bos=True).to(device)
+		with torch.no_grad():
+			prompt_embed = self.model.embed(prompt_tokens)  # [B,S,d]
 		if baseline_prompt is None:
-			baseline_tokens = torch.zeros_like(prompt_tokens)
+			baseline_embed = torch.zeros_like(prompt_embed)
 		else:
 			baseline_tokens = self.model.to_tokens(baseline_prompt, prepend_bos=True).to(device)
+			with torch.no_grad():
+				baseline_embed = self.model.embed(baseline_tokens)
+		diff_embed = prompt_embed - baseline_embed
 		target_id = self.model.to_tokens(target, prepend_bos=False)[0, 0].item()
 
-		embed_name = "hook_embed"
-		def grab(act, hook=None):
-			return act
-		with self.model.hooks([(embed_name, grab)]):
-			base_embed = self.model(baseline_tokens)
-		with self.model.hooks([(embed_name, grab)]):
-			_ = self.model(prompt_tokens)
-		# Re-run to capture real embed
-		with self.model.hooks([(embed_name, lambda a,hook=None: a)]):
-			input_embed = self.model.embed(prompt_tokens)
-		diff = input_embed - input_embed  # (placeholder to keep structure minimal)  # ...existing code could compute true diff if needed
-
+		embed_name = "hook_embed"  # standard name in transformer-lens
 		agg: Dict[Component, float] = {}
 		for step in range(1, steps + 1):
 			alpha = step / steps
+			interp_embed = (baseline_embed + alpha * diff_embed).detach().requires_grad_(False)
 			f_hooks, b_hooks, act_h, act_m, grad_h, grad_m = self._register_hooks()
-			def inject(act, hook=None, alpha=alpha):
-				return base_embed + alpha * (input_embed - base_embed)
-			hook_list = [(embed_name, inject)] + f_hooks + b_hooks
+			def replace_embedding(act, hook=None):  # act: original embedding
+				return interp_embed
 			self.model.zero_grad()
-			with self.model.hooks(hook_list):
+			with self.model.hooks([(embed_name, replace_embedding)] + f_hooks + b_hooks):
 				logits = self.model(prompt_tokens)
 				last_pos = logits.size(1) - 1
 				loss = -logits[0, last_pos, target_id]
 				loss.backward()
 			scores = self._compute_scores(act_h, act_m, grad_h, grad_m)
-			for c,v in scores.items():
+			for c, v in scores.items():
 				agg[c] = agg.get(c, 0.0) + v
+			# cleanup references to reduce memory
 			del loss, logits, scores
 			if torch.cuda.is_available():
 				torch.cuda.empty_cache()
-		for c in list(agg.keys()):
+		# Average
+		for c in agg:
 			agg[c] /= steps
 		items = sorted(agg.items(), key=lambda x: x[1], reverse=True)
 		if self.top_k is not None:
-			items = items[:self.top_k]
-		return {c for c,_ in items}
+			items = items[: self.top_k]
+		return {c for c, _ in items}
 
 def compute_shared_circuit(circuits: List[Set[Component]]) -> Set[Component]:
 	if not circuits: 
