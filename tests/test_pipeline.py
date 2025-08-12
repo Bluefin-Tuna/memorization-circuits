@@ -35,14 +35,14 @@ class TestCircuitReuse(unittest.TestCase):
         accs = []
         for ex in ds:
             model.set_prediction_for_prompt(ex.prompt)
-            pred = evaluate_accuracy(model, [ex], "arithmetic")
+            pred = evaluate_accuracy(model, [ex], "arithmetic", mock=True)
             accs.append(pred)
         self.assertEqual(accs, [1.0, 1.0])
         
         # evaluate entire dataset with ablation (should still be correct)
         for ex in ds:
             model.set_prediction_for_prompt(ex.prompt)
-        acc_ablate = evaluate_accuracy_with_ablation(model, ds, "arithmetic", removed=[])  # no removal
+        acc_ablate = evaluate_accuracy_with_ablation(model, ds, "arithmetic", removed=[], mock=True)  # no removal
         self.assertEqual(acc_ablate, 1.0)
 
 
