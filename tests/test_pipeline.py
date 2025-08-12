@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from circuit_reuse.dataset import AdditionDataset, ArithmeticExample
-from circuit_reuse.dataset import MMLUDataset, MIBDatasetHF
+from circuit_reuse.dataset import MMLUDataset, MIBDataset
 import importlib
 from circuit_reuse.circuit_extraction import Component, compute_shared_circuit
 from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_ablation
@@ -58,7 +58,7 @@ class TestCircuitReuse(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("datasets"), "datasets library not available")
     def test_mib_dataset_loading(self):
         # load a small number of examples from a MIB dataset (ioi)
-        ds = MIBDatasetHF(name="ioi", split="test", num_examples=3)
+        ds = MIBDataset(name="ioi", split="test", num_examples=3)
         
         # ensure some examples loaded and prompt/target are non-empty strings
         self.assertGreater(len(ds), 0)

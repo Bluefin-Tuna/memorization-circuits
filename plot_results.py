@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -60,11 +60,12 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     numeric_cols = [
-        "top_k", "shared_circuit_size", "extraction_seconds", 
+        "top_k", "shared_circuit_size", "extraction_seconds",
         "num_examples", "digits", "ig_steps",
-        "baseline_train_accuracy", "ablation_train_accuracy",
-        "baseline_val_accuracy", "ablation_val_accuracy",
-        "accuracy_drop_train", "accuracy_drop_val", "accuracy_drop_train_val"
+        "baseline_train_accuracy", "ablation_train_accuracy", "control_train_accuracy",
+        "baseline_val_accuracy", "ablation_val_accuracy", "control_val_accuracy",
+        "accuracy_drop_train", "accuracy_drop_val", "accuracy_drop_train_val",
+        "control_accuracy_drop_train", "control_accuracy_drop_val", "control_accuracy_drop_train_val",
     ]
     for c in numeric_cols:
         if c in df.columns:
@@ -82,8 +83,10 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                .agg(
                    baseline_train_accuracy_mean=("baseline_train_accuracy", "mean"),
                    ablation_train_accuracy_mean=("ablation_train_accuracy", "mean"),
+                   control_train_accuracy_mean=("control_train_accuracy", "mean"),
                    baseline_val_accuracy_mean=("baseline_val_accuracy", "mean"),
                    ablation_val_accuracy_mean=("ablation_val_accuracy", "mean"),
+                   control_val_accuracy_mean=("control_val_accuracy", "mean"),
                    runs=("baseline_train_accuracy", "count")
                ))
     if {"top_k", "model_name"}.intersection(df.columns) and \
@@ -96,7 +99,13 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
     sns.set_theme(style="ticks", context="talk", palette="colorblind")
     plt.rcParams.update({"font.family": "serif"})
 
-    def _create_plot(sub, baseline_col, ablation_col, title_suffix, filename_suffix):
+    def _create_plot(sub: pd.DataFrame,
+                     baseline_col: str,
+                     ablation_col: str,
+                     title_suffix: str,
+                     filename_suffix: str,
+                     control_col: Optional[str] = None,
+                     control_label: str = "Control Ablation"):
         if sub.empty:
             return
         # Sorting
@@ -113,32 +122,29 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         
         base_vals = sub[baseline_col].values * (100 if percent else 1)
         abl_vals = sub[ablation_col].values * (100 if percent else 1)
+        has_control = control_col is not None and (control_col in sub)
+        ctrl_vals = sub[control_col].values * (100 if percent else 1) if has_control else None
         
         n_tasks = len(tasks)
         x = np.arange(n_tasks)
         
-        width = 0.40
-        fig_w = max(8.0, 1.2 * n_tasks + 2.5)
-        fig_h = 6.0
-        
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        # Determine bar ordering and spacing. We want: Baseline, Ablated, Control (if present)
-        has_control = bool(control_col and control_col in sub)
+        # Bars
         labels = ["Baseline", "Ablated"]
         value_arrays = [base_vals, abl_vals]
-        colors = [None, "#ff8888"]  # Let matplotlib pick for baseline; red-ish for ablated
+        colors = [None, "#ff8888"]
         if has_control:
-            control_vals = sub[control_col].values * (100 if percent else 1)
             labels.append(control_label)
-            value_arrays.append(control_vals)
+            value_arrays.append(ctrl_vals)
             colors.append("#8888ff")
 
         n_bars = len(labels)
-        # Allocate up to 0.8 of the unit interval for bars, remaining for spacing between groups
         bar_width = 0.8 / n_bars
-        # Center bars around each x position
-        start_offset = - ( (n_bars - 1) / 2.0 ) * bar_width
+        start_offset = -((n_bars - 1) / 2.0) * bar_width
         offsets = [start_offset + i * bar_width for i in range(n_bars)]
+
+        fig_w = max(8.0, 1.2 * n_tasks + 2.5)
+        fig_h = 6.0
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
         bar_containers = []
         for off, lab, vals, col in zip(offsets, labels, value_arrays, colors):
@@ -150,8 +156,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         if percent:
             ax.set_ylim(0, 105)
         else:
-            max_val = float(np.max([base_vals.max() if len(base_vals) else 0,
-                                    abl_vals.max() if len(abl_vals) else 0]))
+            max_val = float(np.max([np.max(v) for v in value_arrays if v is not None])) if value_arrays else 1.0
             ax.set_ylim(0, max_val * 1.08 if max_val > 0 else 1)
         
         def _annotate(bar_container, values):
@@ -163,13 +168,21 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                             xytext=(0, 2.0),
                             textcoords="offset points",
                             ha='center', va='bottom', fontsize=11, zorder=5)
+
+        # Annotate bars
+        if len(bar_containers) >= 1:
+            _annotate(bar_containers[0], base_vals)
+        if len(bar_containers) >= 2:
+            _annotate(bar_containers[1], abl_vals)
+        if has_control and len(bar_containers) >= 3 and ctrl_vals is not None:
+            _annotate(bar_containers[2], ctrl_vals)
         
-        _annotate(bars1, base_vals)
-        _annotate(bars2, abl_vals)
-        
+        # Optional overlay
         if overlay_scores:
-            ax.plot(x, base_vals, marker='o', color='black', linewidth=1)
-            ax.plot(x, abl_vals, marker='s', color='gray', linewidth=1)
+            ax.plot(x, base_vals, marker='o', color='black', linewidth=1, label="_nolegend_")
+            ax.plot(x, abl_vals, marker='s', color='gray', linewidth=1, label="_nolegend_")
+            if has_control and ctrl_vals is not None:
+                ax.plot(x, ctrl_vals, marker='^', color='#3344aa', linewidth=1, label="_nolegend_")
         
         ax.set_xlabel("Task")
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
@@ -192,13 +205,16 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
             sub = method_subset[method_subset.model_display == model_disp].copy()
             safe_model = model_disp.replace(" ", "_")
             pretty_method = METHOD_DISPLAY.get(method, method.title())
+
             # Train/Train
             _create_plot(
                 sub, 
                 "baseline_train_accuracy_mean", 
                 "ablation_train_accuracy_mean",
-                f"{model_disp} - {pretty_method} Train/Train", 
-                f"{safe_model}_{method}_train_train.png"
+                f"{model_disp} - {pretty_method} Train/Train (includes Control Ablation)", 
+                f"{safe_model}_{method}_train_train.png",
+                control_col="control_train_accuracy_mean",
+                control_label="Control Ablation"
             )
             
             # Val/Val if available
@@ -207,8 +223,10 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                     sub, 
                     "baseline_val_accuracy_mean", 
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Val/Val", 
-                    f"{safe_model}_{method}_val_val.png"
+                    f"{model_disp} - {pretty_method} Val/Val (includes Control Ablation)", 
+                    f"{safe_model}_{method}_val_val.png",
+                    control_col="control_val_accuracy_mean",
+                    control_label="Control Ablation"
                 )
             
             # Train/Val if available
@@ -219,23 +237,30 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                     "task_display", 
                     "method", 
                     "baseline_train_accuracy_mean", 
-                    "ablation_val_accuracy_mean"
+                    "ablation_val_accuracy_mean",
+                    "control_val_accuracy_mean"
                 ]].copy()
                 
                 tv.rename(columns={
                     "baseline_train_accuracy_mean": "baseline_train_mean", 
-                    "ablation_val_accuracy_mean": "ablation_val_mean"
+                    "ablation_val_accuracy_mean": "ablation_val_mean",
+                    "control_val_accuracy_mean": "control_val_mean"
                 }, inplace=True)
                 
+                tv2 = tv.rename(columns={
+                    "baseline_train_mean": "baseline_train_accuracy_mean", 
+                    "ablation_val_mean": "ablation_val_accuracy_mean",
+                    "control_val_mean": "control_val_accuracy_mean"
+                })
+
                 _create_plot(
-                    tv.rename(columns={
-                        "baseline_train_mean": "baseline_train_accuracy_mean", 
-                        "ablation_val_mean": "ablation_val_accuracy_mean"
-                    }), 
+                    tv2, 
                     "baseline_train_accuracy_mean", 
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Train/Val", 
-                    f"{safe_model}_{method}_train_val.png"
+                    f"{model_disp} - {pretty_method} Train/Val (includes Control Ablation)", 
+                    f"{safe_model}_{method}_train_val.png",
+                    control_col="control_val_accuracy_mean",
+                    control_label="Control Ablation"
                 )
 
     print(f"[INFO] Plots written to: {out_dir}")

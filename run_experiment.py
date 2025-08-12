@@ -9,12 +9,14 @@ import math
 from pathlib import Path
 from datetime import datetime
 from contextlib import nullcontext
+import random
+import hashlib
 
 import torch
 from transformer_lens import HookedTransformer
 
 from circuit_reuse.dataset import AdditionDataset, get_dataset
-from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit
+from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit, Component
 from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_ablation
 
 def _default_run_name():
@@ -61,6 +63,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.2,
                         help="Fraction of dataset held out for validation evaluation (NOT used for circuit extraction). 0 disables validation.")
     return parser.parse_args()
+
+def _enumerate_all_components(model: HookedTransformer) -> List[Component]:
+    """
+    Enumerate the full set of model components eligible for ablation:
+    all attention heads and all MLPs across all layers.
+    """
+    n_layers = int(getattr(model.cfg, "n_layers", 0))
+    n_heads = int(getattr(model.cfg, "n_heads", 0))
+    comps: List[Component] = []
+    for layer in range(n_layers):
+        # Heads
+        for h in range(n_heads):
+            comps.append(Component(layer=layer, kind="head", index=h))
+        # One MLP per layer
+        comps.append(Component(layer=layer, kind="mlp", index=0))
+    return comps
 
 def _run_single_combination(
     model: HookedTransformer,
@@ -125,6 +143,7 @@ def _run_single_combination(
     shared = compute_shared_circuit(circuits)
     print(f"[{task}] Shared circuit size={len(shared)} (top_k per example={top_k}).")
 
+    # Baseline and shared-circuit ablation metrics
     baseline_train_acc = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
     ablation_train_acc = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=shared, verbose=debug)
     if val_examples:
@@ -133,6 +152,21 @@ def _run_single_combination(
     else:
         baseline_val_acc = float('nan')
         ablation_val_acc = float('nan')
+
+    # CONTROL ABLATION: random components from the full set (heads + MLPs across all layers)
+    all_components = _enumerate_all_components(model)
+    k = min(len(shared), len(all_components))
+    combo_key = f"{model_name}|{task}|{method}|n{num_examples}|d{digits}|k{top_k}"
+    rng_seed = int(hashlib.md5(combo_key.encode("utf-8")).hexdigest()[:8], 16)
+    rng = random.Random(rng_seed)
+    control_removed = rng.sample(all_components, k) if k > 0 else []
+    print(f"[{task}] Control ablation uses {len(control_removed)}/{len(all_components)} random components (seed={rng_seed}).")
+
+    control_train_acc = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=control_removed, verbose=debug)
+    if val_examples:
+        control_val_acc = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=control_removed, verbose=debug)
+    else:
+        control_val_acc = float('nan')
 
     metrics = {
         "model_name": model_name,
@@ -155,6 +189,18 @@ def _run_single_combination(
             str(c) for c in sorted(shared, key=lambda c: (c.layer, c.kind, c.index))
         ],
         "extraction_seconds": end - start,
+
+        # Control ablation metrics
+        "control_train_accuracy": control_train_acc,
+        "control_val_accuracy": control_val_acc,
+        "control_accuracy_drop_train": baseline_train_acc - control_train_acc,
+        "control_accuracy_drop_val": (baseline_val_acc - control_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
+        "control_accuracy_drop_train_val": baseline_train_acc - control_val_acc if not math.isnan(control_val_acc) else float('nan'),
+        "control_removed_components": [
+            str(c) for c in sorted(control_removed, key=lambda c: (c.layer, c.kind, c.index))
+        ],
+        "control_rng_seed": rng_seed,
+        "control_total_component_count": len(all_components),
     }
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -266,12 +312,8 @@ def main() -> None:
                                 print(f"[ERROR] {combo_name} failed: {e}")
                             finally:
                                 # Release hooks/caches if present
-                                if hasattr(model, "reset_hooks"):
-                                    try: model.reset_hooks()
-                                    except Exception: pass
-                                if hasattr(model, "clear_contexts"):
-                                    try: model.clear_contexts()
-                                    except Exception: pass
+                                model.reset_hooks()
+                                model.clear_contexts()
                                 model.zero_grad(set_to_none=True)
                                 torch.cuda.empty_cache()
                                 if args.log_mem:

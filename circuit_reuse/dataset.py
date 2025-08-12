@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from typing import List, Tuple, Iterable
+from datasets import load_dataset  # assume installed
 
 @dataclass
 class ArithmeticExample:
@@ -114,10 +115,6 @@ class BooleanDataset:
 
 class MMLUDataset:
 	def __init__(self, subject: str = "high_school_european_history", split: str = "test", num_examples: int | None = None) -> None:
-		try:
-			from datasets import load_dataset  # type: ignore
-		except ImportError as e:  # pragma: no cover - optional dep
-			raise ImportError("HuggingFace 'datasets' required for MMLU") from e
 		ds = load_dataset("cais/mmlu", subject, split=split)
 		self._examples: List[ArithmeticExample] = []
 		for i, item in enumerate(ds):
@@ -147,12 +144,8 @@ class MMLUDataset:
 	def __iter__(self) -> Iterable[ArithmeticExample]:
 		return iter(self._examples)
 
-class MIBDatasetHF:
+class MIBDataset:
 	def __init__(self, name: str = "ioi", split: str = "test", num_examples: int | None = None) -> None:
-		try:
-			from datasets import load_dataset  # type: ignore
-		except ImportError as e:  # pragma: no cover
-			raise ImportError("HuggingFace 'datasets' required for MIB") from e
 		ds = load_dataset(f"mib-bench/{name}", split=split)
 		self._examples: List[ArithmeticExample] = []
 		count = 0
@@ -228,7 +221,7 @@ def get_dataset(task: str, num_examples: int = 100, digits: int = 2) -> Iterable
 	if task == "mmlu":
 		return MMLUDataset(split='test', num_examples=num_examples)
 	if task.startswith("mib_"):
-		return MIBDatasetHF(name=task[len("mib_"):], split="test", num_examples=num_examples)
+		return MIBDataset(name=task[len("mib_"):], split="test", num_examples=num_examples)
 	raise ValueError(f"Unsupported task: {task}")
 
 __all__ = [
@@ -236,7 +229,7 @@ __all__ = [
 	"AdditionDataset",
 	"BooleanDataset",
 	"MMLUDataset",
-	"MIBDatasetHF",
+	"MIBDataset",
 	"get_dataset",
 	"get_task_display_name",
 	"get_model_display_name",
