@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Define search space
-models=("qwen3-1.7b")
-tasks=("addition" "boolean" "mmlu")
-methods=("gradient" "ig")
+models=("qwen3-0.6b")
+tasks=("addition")
+methods=("gradient")
 top_ks=(100)
 digits_list=(3)
 num_examples_list=(100)

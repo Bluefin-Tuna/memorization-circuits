@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlay-scores", action="store_true",
                    help="Overlay baseline and post-removal accuracies as connected markers above bars.")
     p.add_argument("--no-control", action="store_true",
-                   help="If set, do not plot control ablation results.")
+                   help="If set, do not plot Control results.")
     p.add_argument("--raw", action="store_true",
                    help="Show raw accuracies (0-1). Overrides --percent default.")
     return p.parse_args()
@@ -89,6 +89,8 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                    baseline_val_accuracy_mean=("baseline_val_accuracy", "mean"),
                    ablation_val_accuracy_mean=("ablation_val_accuracy", "mean"),
                    control_val_accuracy_mean=("control_val_accuracy", "mean"),
+                    shared_circuit_size_mean=("shared_circuit_size", "mean"),
+                    top_k_mean=("top_k", "mean"),
                    runs=("baseline_train_accuracy", "count")
                ))
     if {"top_k", "model_name"}.intersection(df.columns) and \
@@ -108,7 +110,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                      title_suffix: str,
                      filename_suffix: str,
                      control_col: Optional[str] = None,
-                     control_label: str = "Control Ablation"):
+                     control_label: str = "Control"):
         if sub.empty:
             return
         # Sorting
@@ -218,17 +220,15 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
             sub = method_subset[method_subset.model_display == model_disp].copy()
             safe_model = model_disp.replace(" ", "_")
             pretty_method = METHOD_DISPLAY.get(method, method.title())
-
-            suffix = " (includes Control Ablation)" if include_control else ""
             # Train/Train
             _create_plot(
                 sub,
                 "baseline_train_accuracy_mean",
                 "ablation_train_accuracy_mean",
-                f"{model_disp} - {pretty_method} Train/Train{suffix}",
+                f"{model_disp} - {pretty_method} Train/Train",
                 f"{safe_model}_{method}_train_train.png",
                 control_col="control_train_accuracy_mean" if include_control else None,
-                control_label="Control Ablation"
+                control_label="Control"
             )
             # Val/Val if available
             if sub["baseline_val_accuracy_mean"].notna().any():
@@ -236,10 +236,10 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                     sub,
                     "baseline_val_accuracy_mean",
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Val/Val{suffix}",
+                    f"{model_disp} - {pretty_method} Val/Val",
                     f"{safe_model}_{method}_val_val.png",
                     control_col="control_val_accuracy_mean" if include_control else None,
-                    control_label="Control Ablation"
+                    control_label="Control"
                 )
             # Train/Val if available
             if (sub["baseline_train_accuracy_mean"].notna().any() and
@@ -269,11 +269,58 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                     tv2,
                     "baseline_train_accuracy_mean",
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Train/Val{suffix}",
+                    f"{model_disp} - {pretty_method} Train/Val",
                     f"{safe_model}_{method}_train_val.png",
                     control_col="control_val_accuracy_mean" if include_control else None,
-                    control_label="Control Ablation"
+                    control_label="Control"
                 )
+
+            # Circuit reuse plot (shared circuit size / top_k). Uses train extraction only; no control.
+            if sub["shared_circuit_size_mean"].notna().any() and sub["top_k_mean"].notna().any():
+                reuse_df = sub[["model_display", "task_display", "method", "shared_circuit_size_mean", "top_k_mean"]].copy()
+                # Avoid division by zero
+                reuse_df = reuse_df[reuse_df["top_k_mean"] > 0]
+                if not reuse_df.empty:
+                    reuse_df["reuse_fraction"] = reuse_df["shared_circuit_size_mean"] / reuse_df["top_k_mean"].clip(lower=1e-9)
+                    if percent:
+                        reuse_df["reuse_plot_value"] = reuse_df["reuse_fraction"] * 100.0
+                    else:
+                        reuse_df["reuse_plot_value"] = reuse_df["reuse_fraction"]
+                    # Sorting for reuse: by value desc if sort_by in certain modes, else task name
+                    if sort_by in {"drop", "baseline", "ablation"}:
+                        reuse_df = reuse_df.sort_values("reuse_plot_value", ascending=False)
+                    else:
+                        reuse_df = reuse_df.sort_values("task_display")
+                    tasks = list(reuse_df.task_display)
+                    vals = reuse_df["reuse_plot_value"].values
+                    x = np.arange(len(tasks))
+                    fig_w = max(7.0, 0.9 * len(tasks) + 3.0)
+                    fig, ax = plt.subplots(figsize=(fig_w, 5.0))
+                    line_color = sns.color_palette("colorblind")[3 % len(sns.color_palette("colorblind"))]
+                    ax.plot(x, vals, marker='o', linewidth=2, color=line_color)
+                    for xi, v, task in zip(x, vals, tasks):
+                        label = f"{v:.1f}%" if percent else f"{v:.2f}"
+                        ax.annotate(label,
+                                    (xi, v),
+                                    xytext=(0, 6 if percent else 0.02),
+                                    textcoords="offset points",
+                                    ha="center", va="bottom", fontsize=10)
+                    ax.set_ylabel("Shared Circuit (% of top_k)" if percent else "Shared Circuit Fraction")
+                    ax.set_xlabel("Task")
+                    ylim_top = 100 if percent else 1.0
+                    ypad = 5 if percent else 0.05
+                    ax.set_ylim(0, ylim_top + ypad)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(tasks, rotation=0)
+                    ax.set_title(f"{model_disp} - {pretty_method} Circuit Reuse")
+                    ax.grid(axis='y', linestyle='--', alpha=0.7)
+                    fig.tight_layout()
+                    reuse_fname = f"{safe_model}_{method}_reuse.png"
+                    plt.savefig(out_dir / reuse_fname, dpi=200, bbox_inches="tight")
+                    saved_files.append(reuse_fname)
+                    if show:
+                        plt.show()
+                    plt.close()
 
     print(f"[INFO] Plots written to: {out_dir}")
     print(f"[INFO] Files: {', '.join(saved_files)}")

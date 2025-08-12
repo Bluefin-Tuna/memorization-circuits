@@ -69,15 +69,43 @@ def _enumerate_all_components(model: HookedTransformer) -> List[Component]:
     Enumerate the full set of model components eligible for ablation:
     all attention heads and all MLPs across all layers.
     """
-    n_layers = int(getattr(model.cfg, "n_layers", 0))
+    # Primary metadata from config; provide fallbacks in case attributes differ
+    try:
+        n_layers = int(getattr(model.cfg, "n_layers", len(getattr(model, "blocks", []))))
+    except Exception:
+        n_layers = len(getattr(model, "blocks", []))
+    # Some models may expose n_heads_kv (grouped query attention). We only ablate standard heads actually produced
+    # in attn.hook_result which has shape [..., n_heads, d_head]. So prefer cfg.n_heads.
     n_heads = int(getattr(model.cfg, "n_heads", 0))
+    if n_layers == 0 or n_heads == 0:
+        # Best-effort inference from first attention module if possible
+        try:
+            first_attn = getattr(model.blocks[0], "attn", None)
+            if first_attn is not None and hasattr(first_attn, "num_heads"):
+                n_heads = n_heads or int(first_attn.num_heads)
+            if n_layers == 0:
+                n_layers = len(model.blocks)
+        except Exception:
+            pass
+
     comps: List[Component] = []
     for layer in range(n_layers):
-        # Heads
+        # Attention heads
         for h in range(n_heads):
             comps.append(Component(layer=layer, kind="head", index=h))
-        # One MLP per layer
+        # One MLP block per layer (transformer-lens exposes a single MLP per layer)
         comps.append(Component(layer=layer, kind="mlp", index=0))
+
+    # Sanity: ensure uniqueness (should already hold due to dataclass hash)
+    # but guard against accidental duplicates if logic changes.
+    if len(set(comps)) != len(comps):  # pragma: no cover - defensive
+        seen = set()
+        deduped = []
+        for c in comps:
+            if c not in seen:
+                seen.add(c)
+                deduped.append(c)
+        comps = deduped
     return comps
 
 def _run_single_combination(
