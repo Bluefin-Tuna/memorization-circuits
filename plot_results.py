@@ -122,9 +122,28 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         fig_h = 6.0
         
         fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        
-        bars1 = ax.bar(x - width/2, base_vals, width, label="Baseline")
-        bars2 = ax.bar(x + width/2, abl_vals, width, label="Ablated")
+        # Determine bar ordering and spacing. We want: Baseline, Ablated, Control (if present)
+        has_control = bool(control_col and control_col in sub)
+        labels = ["Baseline", "Ablated"]
+        value_arrays = [base_vals, abl_vals]
+        colors = [None, "#ff8888"]  # Let matplotlib pick for baseline; red-ish for ablated
+        if has_control:
+            control_vals = sub[control_col].values * (100 if percent else 1)
+            labels.append(control_label)
+            value_arrays.append(control_vals)
+            colors.append("#8888ff")
+
+        n_bars = len(labels)
+        # Allocate up to 0.8 of the unit interval for bars, remaining for spacing between groups
+        bar_width = 0.8 / n_bars
+        # Center bars around each x position
+        start_offset = - ( (n_bars - 1) / 2.0 ) * bar_width
+        offsets = [start_offset + i * bar_width for i in range(n_bars)]
+
+        bar_containers = []
+        for off, lab, vals, col in zip(offsets, labels, value_arrays, colors):
+            bc = ax.bar(x + off, vals, bar_width * 0.95, label=lab, color=col, zorder=3, edgecolor=None)
+            bar_containers.append(bc)
         
         ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
         
@@ -157,7 +176,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         ax.set_xticks(x)
         ax.set_xticklabels(tasks, rotation=0, ha='center')
         ax.set_title(title_suffix)
-        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.20), ncol=2, frameon=True)
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.20), ncol=n_bars, frameon=True)
         fig.tight_layout(rect=[0, 0.05, 1, 1])
         
         out_path = out_dir / filename_suffix
