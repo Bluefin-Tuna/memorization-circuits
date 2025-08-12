@@ -5,16 +5,10 @@ import torch
 from .dataset import ArithmeticExample  # type: ignore
 from .circuit_extraction import Component  # type: ignore
 
-
-def _is_tensorlike(x) -> bool:
-	return hasattr(x, "shape") or hasattr(x, "size")
-
-
 def _predict_next_token_mock(model: Any, prompt: str) -> int:
 	if hasattr(model, "predictions") and isinstance(model.predictions, dict):
 		return int(model.predictions.get(prompt, 0))
 	return 0
-
 
 def _extract_gold_ids(model: Any, prompt: str, target: str, device, verbose: bool = False) -> List[int]:
 	"""
@@ -52,7 +46,6 @@ def _extract_gold_ids(model: Any, prompt: str, target: str, device, verbose: boo
 		print(f"[WARN] Derived empty gold ids unexpectedly; prompt_len={len(p_ids)} full_len={len(f_ids)}")
 	return [int(x) for x in gold_ids]
 
-
 # Simple caches to avoid repeated tokenization per example
 _BOOL_CACHE = {}
 _MC_CACHE = {}
@@ -80,7 +73,6 @@ def _boolean_token_id_groups(model) -> Tuple[set, set]:
 	_BOOL_CACHE[cache_key] = res
 	return res
 
-
 def _classify_boolean(logits_last: Any, model, verbose: bool = False) -> Tuple[str, dict]:
 	"""Classify between true/false given final-position logits."""
 	true_ids, false_ids = _boolean_token_id_groups(model)
@@ -99,7 +91,6 @@ def _classify_boolean(logits_last: Any, model, verbose: bool = False) -> Tuple[s
 	if verbose:
 		print(f"[BOOL-CLASSIFY] true_score={true_score:.3f} false_score={false_score:.3f} label={label} true_ids={sorted(true_ids)} false_ids={sorted(false_ids)}")
 	return label, id_logits
-
 
 def _mc_letter_token_id_groups(model) -> dict:
 	"""Collect possible single-token ids for letters A-D across spacing variants (cached per model)."""
@@ -124,7 +115,6 @@ def _mc_letter_token_id_groups(model) -> dict:
 	_MC_CACHE[cache_key] = out
 	return out
 
-
 def _classify_multiple_choice(logits_last: Any, model, verbose: bool = False) -> str:
 	"""Select letter A-D with highest logit (max over variant token ids)."""
 	groups = _mc_letter_token_id_groups(model)
@@ -142,7 +132,6 @@ def _classify_multiple_choice(logits_last: Any, model, verbose: bool = False) ->
 			f"{L}:{'none' if not ids else max(logits_last[i].item() for i in ids):.3f}" for L, ids in groups.items()
 		))
 	return best_letter
-
 
 def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: str, verbose: bool = False, mock: bool = False) -> float:
 	"""Evaluate accuracy on a dataset for a given task."""
@@ -201,7 +190,6 @@ def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: st
 			correct += 1
 		total += 1
 	return correct / total if total else 0.0
-
 
 def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False, mock: bool = False) -> float:
 	"""Evaluate accuracy under component ablation for a specified task."""

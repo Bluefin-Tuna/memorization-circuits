@@ -17,10 +17,8 @@ from circuit_reuse.dataset import AdditionDataset, get_dataset
 from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit
 from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_ablation
 
-
 def _default_run_name():
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
 
 def _prepare_run_dir(output_dir: str, run_name: str | None):
     base = Path(output_dir)
@@ -29,7 +27,6 @@ def _prepare_run_dir(output_dir: str, run_name: str | None):
     run_dir = base / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
-
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI args (modern multi-run only)."""
@@ -64,7 +61,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.2,
                         help="Fraction of dataset held out for validation evaluation (NOT used for circuit extraction). 0 disables validation.")
     return parser.parse_args()
-
 
 def _run_single_combination(
     model: HookedTransformer,
@@ -187,7 +183,6 @@ def _run_single_combination(
 
     print(f"[DONE] {run_dir}")
     return metrics
-
 
 def main() -> None:
     """Run experiment end-to-end (single or multi-run)."""

@@ -11,13 +11,11 @@ import seaborn as sns
 import numpy as np
 from circuit_reuse.dataset import get_task_display_name, get_model_display_name
 
-
 # Method display names
 METHOD_DISPLAY = {
     "gradient": "Gradient",
     "ig": "Integrated Gradients",
 }
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Plot circuit reuse experiment results.")
@@ -40,12 +38,10 @@ def parse_args() -> argparse.Namespace:
                    help="Show raw accuracies (0-1). Overrides --percent default.")
     return p.parse_args()
 
-
 def discover_metrics(results_dir: Path) -> List[Path]:
     if not results_dir.exists():
         return []
     return sorted(results_dir.rglob("metrics.json"))
-
 
 def load_metrics_json(path: Path) -> Dict[str, Any]:
     try:
@@ -57,7 +53,6 @@ def load_metrics_json(path: Path) -> Dict[str, Any]:
     except Exception as e:
         print(f"[WARN] Failed to load {path}: {e}")
         return {}
-
 
 def aggregate(paths: List[Path]) -> pd.DataFrame:
     rows = [d for p in paths if (d := load_metrics_json(p))]
@@ -75,7 +70,6 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
-
 
 def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
              percent: bool, overlay_scores: bool):
@@ -228,7 +222,6 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
     print(f"[INFO] Plots written to: {out_dir}")
     print(f"[INFO] Files: {', '.join(saved_files)}")
 
-
 def main():
     args = parse_args()
     results_dir = Path(args.results_dir)
@@ -265,7 +258,6 @@ def main():
         percent=percent,
         overlay_scores=args.overlay_scores,
     )
-
 
 if __name__ == "__main__":
     main()

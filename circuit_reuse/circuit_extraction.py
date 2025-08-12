@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import torch
 from transformer_lens import HookedTransformer
 
-
 @dataclass(frozen=True)
 class Component:
 	layer: int
@@ -16,7 +15,6 @@ class Component:
 		return hash((self.layer, self.kind, self.index))
 	def __repr__(self) -> str:  # pragma: no cover - repr trivial
 		return f"{self.kind}[layer={self.layer}, index={self.index}]"
-
 
 class CircuitExtractor:
 	def __init__(self, model: Any, top_k: Optional[int] = 5) -> None:
@@ -192,7 +190,6 @@ class CircuitExtractor:
 			items = items[:self.top_k]
 
 		return {c for c,_ in items}
-
 
 def compute_shared_circuit(circuits: List[Set[Component]]) -> Set[Component]:
 	if not circuits: return set()

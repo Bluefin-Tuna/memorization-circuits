@@ -12,13 +12,11 @@ try:
 except Exception:
     torch = None  # type: ignore
 
-
 class MockConfig:
     def __init__(self, n_layers: int = 1, n_heads: int = 1, device: str = "cpu"):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.device = device
-
 
 class MockModel:
     def __init__(self, predictions: Dict[str, int]):
@@ -69,6 +67,5 @@ class MockModel:
     # convenience: store predicted id for current prompt
     def set_prediction_for_prompt(self, prompt: str):
         self._last_pred = self.predictions.get(prompt, 0)
-
 
 __all__ = ["MockModel"]

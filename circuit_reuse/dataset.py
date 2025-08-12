@@ -9,7 +9,6 @@ class ArithmeticExample:
 	prompt: str
 	target: str
 
-
 class AdditionDataset:
 	def __init__(self, num_examples: int = 100, digits: int = 2) -> None:
 		self.num_examples = num_examples
@@ -36,7 +35,6 @@ class AdditionDataset:
 
 	def __iter__(self) -> Iterable[ArithmeticExample]:
 		return iter(self._examples)
-
 
 class BooleanDataset:
 	"""Generate boolean expressions with optional parentheses and NOT, AND, OR.
@@ -149,7 +147,6 @@ class MMLUDataset:
 	def __iter__(self) -> Iterable[ArithmeticExample]:
 		return iter(self._examples)
 
-
 class MIBDatasetHF:
 	def __init__(self, name: str = "ioi", split: str = "test", num_examples: int | None = None) -> None:
 		try:
@@ -203,7 +200,6 @@ def get_task_display_name(task: str) -> str:
 		return f"MIB: {suffix}"
 	return task.replace("_", " ").title()
 
-
 def get_model_display_name(model: str) -> str:
 	"""
 	Human-friendly model name:
@@ -223,7 +219,6 @@ def get_model_display_name(model: str) -> str:
 		else:
 			rest.append(p)
 	return " ".join([first] + rest)
-
 
 def get_dataset(task: str, num_examples: int = 100, digits: int = 2) -> Iterable[ArithmeticExample]:
 	if task == "addition":

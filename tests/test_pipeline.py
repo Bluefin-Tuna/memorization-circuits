@@ -9,7 +9,6 @@ from circuit_reuse.circuit_extraction import Component, compute_shared_circuit
 from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_ablation
 from .mock_model import MockModel
 
-
 class TestCircuitReuse(unittest.TestCase):
     def test_compute_shared_circuit(self):
         # two circuits with partial overlap
@@ -45,7 +44,6 @@ class TestCircuitReuse(unittest.TestCase):
         acc_ablate = evaluate_accuracy_with_ablation(model, ds, "arithmetic", removed=[], mock=True)  # no removal
         self.assertEqual(acc_ablate, 1.0)
 
-
     @unittest.skipUnless(importlib.util.find_spec("datasets"), "datasets library not available")
     def test_mmlu_dataset_loading(self):
         # load a small number of examples from a  MMLU subject
@@ -67,7 +65,6 @@ class TestCircuitReuse(unittest.TestCase):
         for ex in ds:
             self.assertIsInstance(ex.prompt, str)
             self.assertIsInstance(ex.target, str)
-
 
 if __name__ == "__main__":
     unittest.main()
