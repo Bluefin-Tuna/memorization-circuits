@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""
-Aggregate and plot experiment metrics produced by run_experiment.py.
-
-Produces one grouped bar plot per attribution method: baseline vs ablation accuracy
-with value labels on each bar.
-"""
 from __future__ import annotations
 import argparse
 import json
@@ -72,8 +65,11 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     numeric_cols = [
-        "baseline_accuracy", "ablation_accuracy", "accuracy_drop", "top_k",
-        "shared_circuit_size", "extraction_seconds", "num_examples", "digits", "ig_steps"
+        "top_k", "shared_circuit_size", "extraction_seconds", 
+        "num_examples", "digits", "ig_steps",
+        "baseline_train_accuracy", "ablation_train_accuracy",
+        "baseline_val_accuracy", "ablation_val_accuracy",
+        "accuracy_drop_train", "accuracy_drop_val", "accuracy_drop_train_val"
     ]
     for c in numeric_cols:
         if c in df.columns:
@@ -90,10 +86,11 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
     grouped = (df
                .groupby(["model_display", "task_display", "method"], as_index=False)
                .agg(
-                   baseline_accuracy_mean=("baseline_accuracy", "mean"),
-                   ablation_accuracy_mean=("ablation_accuracy", "mean"),
-                   accuracy_drop_mean=("accuracy_drop", "mean"),
-                   runs=("baseline_accuracy", "count")
+                   baseline_train_accuracy_mean=("baseline_train_accuracy", "mean"),
+                   ablation_train_accuracy_mean=("ablation_train_accuracy", "mean"),
+                   baseline_val_accuracy_mean=("baseline_val_accuracy", "mean"),
+                   ablation_val_accuracy_mean=("ablation_val_accuracy", "mean"),
+                   runs=("baseline_train_accuracy", "count")
                ))
     if {"top_k", "model_name"}.intersection(df.columns) and \
        (df[["model_name", "task", "method"]].drop_duplicates().shape[0] != grouped.shape[0]):
@@ -105,73 +102,128 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
     sns.set_theme(style="ticks", context="talk", palette="colorblind")
     plt.rcParams.update({"font.family": "serif"})
 
+    def _create_plot(sub, baseline_col, ablation_col, title_suffix, filename_suffix):
+        if sub.empty:
+            return
+        # Sorting
+        if sort_by == "drop" and baseline_col in sub and ablation_col in sub:
+            sub = sub.assign(_drop=sub[baseline_col] - sub[ablation_col]).sort_values("_drop", ascending=False)
+        elif sort_by == "baseline" and baseline_col in sub:
+            sub = sub.sort_values(baseline_col, ascending=False)
+        elif sort_by == "ablation" and ablation_col in sub:
+            sub = sub.sort_values(ablation_col, ascending=False)
+        else:
+            sub = sub.sort_values("task_display")
+            
+        tasks = list(sub.task_display)
+        
+        base_vals = sub[baseline_col].values * (100 if percent else 1)
+        abl_vals = sub[ablation_col].values * (100 if percent else 1)
+        
+        n_tasks = len(tasks)
+        x = np.arange(n_tasks)
+        
+        width = 0.40
+        fig_w = max(8.0, 1.2 * n_tasks + 2.5)
+        fig_h = 6.0
+        
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        
+        bars1 = ax.bar(x - width/2, base_vals, width, label="Baseline")
+        bars2 = ax.bar(x + width/2, abl_vals, width, label="Ablated")
+        
+        ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
+        
+        if percent:
+            ax.set_ylim(0, 105)
+        else:
+            max_val = float(np.max([base_vals.max() if len(base_vals) else 0,
+                                    abl_vals.max() if len(abl_vals) else 0]))
+            ax.set_ylim(0, max_val * 1.08 if max_val > 0 else 1)
+        
+        def _annotate(bar_container, values):
+            for rect, val in zip(bar_container, values):
+                h = rect.get_height()
+                label = f"{val:.1f}" if percent else f"{val:.3f}"
+                ax.annotate(label,
+                            xy=(rect.get_x() + rect.get_width() / 2, h),
+                            xytext=(0, 2.0),
+                            textcoords="offset points",
+                            ha='center', va='bottom', fontsize=11, zorder=5)
+        
+        _annotate(bars1, base_vals)
+        _annotate(bars2, abl_vals)
+        
+        if overlay_scores:
+            ax.plot(x, base_vals, marker='o', color='black', linewidth=1)
+            ax.plot(x, abl_vals, marker='s', color='gray', linewidth=1)
+        
+        ax.set_xlabel("Task")
+        ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
+        ax.set_xticks(x)
+        ax.set_xticklabels(tasks, rotation=0, ha='center')
+        ax.set_title(title_suffix)
+        ax.legend(loc='upper right', frameon=True)
+        fig.tight_layout()
+        
+        out_path = out_dir / filename_suffix
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        saved_files.append(out_path.name)
+        if show:
+            plt.show()
+        plt.close()
+
     for method in methods:
         method_subset = grouped[grouped["method"] == method]
         for model_disp in sorted(method_subset.model_display.unique()):
             sub = method_subset[method_subset.model_display == model_disp].copy()
-
-            if sort_by == "drop":
-                sub = sub.sort_values("accuracy_drop_mean", ascending=False)
-            elif sort_by == "baseline":
-                sub = sub.sort_values("baseline_accuracy_mean", ascending=False)
-            elif sort_by == "ablation":
-                sub = sub.sort_values("ablation_accuracy_mean", ascending=False)
-            else:
-                sub = sub.sort_values("task_display")
-
-            tasks = list(sub.task_display)
-            baseline = sub.baseline_accuracy_mean.values * (100 if percent else 1)
-            after = sub.ablation_accuracy_mean.values * (100 if percent else 1)
-            n_tasks = len(tasks)
-            x = np.arange(n_tasks)
-            width = 0.40
-
-            fig_w = max(8.0, 1.2 * n_tasks + 2.5)
-            fig_h = 6.0
-            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-
-            bars1 = ax.bar(x - width/2, baseline, width, label="Baseline")
-            bars2 = ax.bar(x + width/2, after, width, label="Ablated")
-
-            ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
-            if percent:
-                ax.set_ylim(0, 105)
-            else:
-                max_val = float(np.max([baseline.max() if len(baseline) else 0,
-                                        after.max() if len(after) else 0]))
-                ax.set_ylim(0, max_val * 1.08 if max_val > 0 else 1)
-
-            def _annotate(bar_container, values):
-                for rect, val in zip(bar_container, values):
-                    h = rect.get_height()
-                    label = f"{val:.1f}" if percent else f"{val:.3f}"
-                    ax.annotate(label,
-                                xy=(rect.get_x() + rect.get_width() / 2, h),
-                                xytext=(0, 2.0),
-                                textcoords="offset points",
-                                ha='center', va='bottom', fontsize=11, zorder=5)
-
-            _annotate(bars1, baseline)
-            _annotate(bars2, after)
-
-            ax.set_xlabel("Task")
-            ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
-            ax.set_xticks(x)
-            ax.set_xticklabels(tasks, rotation=0, ha='center')
-            ax.set_title(f"{model_disp} – {METHOD_DISPLAY.get(method, method.title())} Attribution")
-
-            ax.legend(loc='upper right', frameon=True)
-            fig.tight_layout()
-
-            suffix = 'pct' if percent else 'raw'
             safe_model = model_disp.replace(" ", "_")
-            out_path = out_dir / f"{safe_model}_accuracy_{method}_{suffix}.png"
-            plt.savefig(out_path, dpi=200, bbox_inches="tight")
-            saved_files.append(out_path.name)
-
-            if show:
-                plt.show()
-            plt.close()
+            pretty_method = METHOD_DISPLAY.get(method, method.title())
+            # Train/Train
+            _create_plot(
+                sub, 
+                "baseline_train_accuracy_mean", 
+                "ablation_train_accuracy_mean",
+                f"{model_disp} - {pretty_method} Train/Train", 
+                f"{safe_model}_{method}_train_train.png"
+            )
+            
+            # Val/Val if available
+            if sub["baseline_val_accuracy_mean"].notna().any():
+                _create_plot(
+                    sub, 
+                    "baseline_val_accuracy_mean", 
+                    "ablation_val_accuracy_mean",
+                    f"{model_disp} - {pretty_method} Val/Val", 
+                    f"{safe_model}_{method}_val_val.png"
+                )
+            
+            # Train/Val if available
+            if (sub["baseline_train_accuracy_mean"].notna().any() and 
+                sub["ablation_val_accuracy_mean"].notna().any()):
+                tv = sub[[
+                    "model_display", 
+                    "task_display", 
+                    "method", 
+                    "baseline_train_accuracy_mean", 
+                    "ablation_val_accuracy_mean"
+                ]].copy()
+                
+                tv.rename(columns={
+                    "baseline_train_accuracy_mean": "baseline_train_mean", 
+                    "ablation_val_accuracy_mean": "ablation_val_mean"
+                }, inplace=True)
+                
+                _create_plot(
+                    tv.rename(columns={
+                        "baseline_train_mean": "baseline_train_accuracy_mean", 
+                        "ablation_val_mean": "ablation_val_accuracy_mean"
+                    }), 
+                    "baseline_train_accuracy_mean", 
+                    "ablation_val_accuracy_mean",
+                    f"{model_disp} - {pretty_method} Train/Val", 
+                    f"{safe_model}_{method}_train_val.png"
+                )
 
     print(f"[INFO] Plots written to: {out_dir}")
     print(f"[INFO] Files: {', '.join(saved_files)}")

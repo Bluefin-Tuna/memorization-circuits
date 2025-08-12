@@ -5,6 +5,7 @@ import argparse
 import time
 from typing import List
 import json
+import math
 from pathlib import Path
 from datetime import datetime
 from contextlib import nullcontext
@@ -60,6 +61,8 @@ def parse_args() -> argparse.Namespace:
                         help="Print CUDA memory after each combo.")
     parser.add_argument("--amp", action="store_true",
                         help="Use autocast (mixed precision) during extraction.")
+    parser.add_argument("--val-fraction", type=float, default=0.2,
+                        help="Fraction of dataset held out for validation evaluation (NOT used for circuit extraction). 0 disables validation.")
     return parser.parse_args()
 
 
@@ -76,6 +79,7 @@ def _run_single_combination(
     debug: bool,
     run_dir: Path,
     amp: bool,
+    val_fraction: float,
 ):
     """Execute one (model, task, num_examples, digits, top_k, method) combo and write outputs into run_dir."""
     # DATASET
@@ -88,6 +92,18 @@ def _run_single_combination(
 
     extractor = CircuitExtractor(model, top_k=top_k)
 
+    # Train/validation split (validation only for evaluation)
+    examples = list(dataset)
+    n = len(examples)
+    vf = max(0.0, min(0.9, val_fraction))  # clamp
+    val_count = int(round(vf * n)) if vf > 0 else 0
+    if val_count >= n and n > 1:
+        val_count = n - 1
+    train_examples = examples[: n - val_count]
+    val_examples = examples[n - val_count:]
+    if debug:
+        print(f"[SPLIT] total={n} train={len(train_examples)} val={len(val_examples)} (val_fraction={vf:.2f})")
+
     circuits: List[set] = []
     start = time.time()
     autocast_ctx = (
@@ -95,7 +111,7 @@ def _run_single_combination(
         if amp and device.startswith("cuda")
         else nullcontext()
     )
-    for idx, example in enumerate(dataset):
+    for idx, example in enumerate(train_examples):
         with autocast_ctx:
             if method == "gradient":
                 comp_set = extractor.extract_circuit(example.prompt, example.target)
@@ -104,8 +120,8 @@ def _run_single_combination(
         circuits.append(comp_set)
         if debug:
             print(f"[EXTRACT {task}] idx={idx} comps={len(comp_set)}")
-        if (idx + 1) % 10 == 0 or (idx + 1) == len(dataset):
-            print(f"[{task}] {idx + 1}/{len(dataset)} examples (last circuit size={len(comp_set)})")
+        if (idx + 1) % 10 == 0 or (idx + 1) == len(train_examples):
+            print(f"[{task}] {idx + 1}/{len(train_examples)} train examples (last circuit size={len(comp_set)})")
         # free intermediate grads right away
         model.zero_grad(set_to_none=True)
     end = time.time()
@@ -113,8 +129,14 @@ def _run_single_combination(
     shared = compute_shared_circuit(circuits)
     print(f"[{task}] Shared circuit size={len(shared)} (top_k per example={top_k}).")
 
-    baseline_acc = evaluate_accuracy(model, dataset, task=task, verbose=debug)
-    knockout_acc = evaluate_accuracy_with_ablation(model, dataset, task=task, removed=shared, verbose=debug)
+    baseline_train_acc = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
+    ablation_train_acc = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=shared, verbose=debug)
+    if val_examples:
+        baseline_val_acc = evaluate_accuracy(model, val_examples, task=task, verbose=debug)
+        ablation_val_acc = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=shared, verbose=debug)
+    else:
+        baseline_val_acc = float('nan')
+        ablation_val_acc = float('nan')
 
     metrics = {
         "model_name": model_name,
@@ -124,9 +146,14 @@ def _run_single_combination(
         "top_k": top_k,
         "method": method,
         "ig_steps": steps if method == "ig" else None,
-        "baseline_accuracy": baseline_acc,
-        "ablation_accuracy": knockout_acc,
-        "accuracy_drop": baseline_acc - knockout_acc,
+        "baseline_train_accuracy": baseline_train_acc,
+        "ablation_train_accuracy": ablation_train_acc,
+        "baseline_val_accuracy": baseline_val_acc,
+        "ablation_val_accuracy": ablation_val_acc,
+        "accuracy_drop_train": baseline_train_acc - ablation_train_acc,
+        "accuracy_drop_val": (baseline_val_acc - ablation_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
+        "accuracy_drop_train_val": baseline_train_acc - ablation_val_acc if not math.isnan(ablation_val_acc) else float('nan'),
+        "val_fraction": vf,
         "shared_circuit_size": len(shared),
         "shared_circuit_components": [
             str(c) for c in sorted(shared, key=lambda c: (c.layer, c.kind, c.index))
@@ -236,6 +263,7 @@ def main() -> None:
                                     debug=args.debug,
                                     run_dir=run_dir,
                                     amp=args.amp,
+                                    val_fraction=args.val_fraction,
                                 )
                             except torch.cuda.OutOfMemoryError as oom:
                                 print(f"[OOM] Skipping {combo_name}: {oom}")
