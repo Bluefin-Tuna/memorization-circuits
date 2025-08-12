@@ -39,25 +39,71 @@ class AdditionDataset:
 
 
 class BooleanDataset:
-	def __init__(self, num_examples: int = 100) -> None:
+	"""Generate boolean expressions with optional parentheses and NOT, AND, OR.
+
+	We sample expressions of a target token length; each operand is 'true' or 'false'.
+	Grammar (simplified):
+	EXPR -> TERM ( (and|or) TERM )*
+	TERM -> FACTOR | 'not' FACTOR | '(' EXPR ')'
+	FACTOR -> 'true' | 'false'
+	We generate until we have num_examples unique expressions.
+	"""
+	def __init__(self, num_examples: int = 100, min_ops: int = 2, max_ops: int = 6, allow_parentheses: bool = True, allow_not: bool = True) -> None:
 		self.num_examples = num_examples
+		self.min_ops = min_ops
+		self.max_ops = max_ops
+		self.allow_parentheses = allow_parentheses
+		self.allow_not = allow_not
 		self._examples: List[ArithmeticExample] = []
 		self._generate_examples()
 
+	def _rand_bool(self) -> str:
+		return random.choice(['true', 'false'])
+
+	def _maybe_not(self, token: str) -> str:
+		if self.allow_not and random.random() < 0.3:
+			return 'not ' + token
+		return token
+
+	def _gen_expr(self, remaining_ops: int) -> str:
+		# remaining_ops counts number of binary operators still to insert
+		if remaining_ops == 0:
+			atom = self._maybe_not(self._rand_bool())
+			return atom
+		# Split operators between left/right
+		left_ops = random.randint(0, remaining_ops - 1)
+		right_ops = remaining_ops - 1 - left_ops
+		left = self._gen_expr(left_ops)
+		right = self._gen_expr(right_ops)
+		op = random.choice(['and', 'or'])
+		expr = f"{left} {op} {right}"
+		if self.allow_parentheses and random.random() < 0.5:
+			expr = f"({expr})"
+		return expr
+
+	def _evaluate(self, expr: str) -> bool:
+		# Safe evaluation: replace 'true'/'false'
+		py_expr = expr.replace('true', 'True').replace('false', 'False')
+		return bool(eval(py_expr))  # noqa: S307 (controlled vocabulary)
+
 	def _generate_examples(self) -> None:
-		ops = ["AND", "OR"]
-		for _ in range(self.num_examples):
-			a = random.choice([True, False])
-			b = random.choice([True, False])
-			op = random.choice(ops)
-			if random.random() < 0.5:
-				a = not a
-			if random.random() < 0.5:
-				b = not b
-			prompt = f"Respond with either true or false. {str(a).lower()} {op} {str(b).lower()} = "
-			target_bool = (a and b) if op == "AND" else (a or b)
-			target = str(target_bool).lower()
-			self._examples.append(ArithmeticExample(prompt, target))
+		self._examples = []
+		seen = set()
+		attempts = 0
+		max_attempts = self.num_examples * 20
+
+		while len(self._examples) < self.num_examples and attempts < max_attempts:
+			attempts += 1
+			n_ops = random.randint(self.min_ops, self.max_ops)
+			expr = self._gen_expr(n_ops)
+
+			if expr in seen:
+				continue
+
+			seen.add(expr)
+			val = str(self._evaluate(expr)).lower()
+			prompt = f"Evaluate: {expr} = "
+			self._examples.append(ArithmeticExample(prompt, val))
 
 	def __len__(self) -> int:
 		return len(self._examples)
