@@ -91,7 +91,7 @@ class CircuitExtractor:
 			loss.backward()
 		scores = self._compute_scores(act_h, act_m, grad_h, grad_m)
 		items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-		import pdb; pdb.set_trace()
+
 		if self.top_k is not None:
 			items = items[:self.top_k]
 		return {c for c,_ in items}
