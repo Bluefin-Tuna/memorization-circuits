@@ -157,8 +157,8 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         ax.set_xticks(x)
         ax.set_xticklabels(tasks, rotation=0, ha='center')
         ax.set_title(title_suffix)
-        ax.legend(loc='upper right', frameon=True)
-        fig.tight_layout()
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.20), ncol=2, frameon=True)
+        fig.tight_layout(rect=[0, 0.05, 1, 1])
         
         out_path = out_dir / filename_suffix
         plt.savefig(out_path, dpi=200, bbox_inches="tight")
