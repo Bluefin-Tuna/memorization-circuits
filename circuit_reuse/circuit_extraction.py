@@ -181,6 +181,11 @@ class CircuitExtractor:
 			for comp, val in scores.items():
 				agg_scores[comp] = agg_scores.get(comp, 0.0) + val
 
+			# Cleanup to reduce memory
+			del loss, logits, scores, act_h, act_m, grad_h, grad_m
+			if torch.cuda.is_available():
+				torch.cuda.empty_cache()
+
 		# average
 		for comp in list(agg_scores.keys()):
 			agg_scores[comp] /= steps
