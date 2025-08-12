@@ -4,6 +4,7 @@
 import argparse
 import time
 from typing import List
+import random
 import json
 import math
 from pathlib import Path
@@ -127,12 +128,29 @@ def _run_single_combination(
 
     baseline_train_acc = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
     ablation_train_acc = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=shared, verbose=debug)
+
+    # Control ablation: random set with same size as shared circuit, sampled from union of all extracted components.
+    all_components = set().union(*circuits) if circuits else set()
+    if len(shared) > 0 and len(all_components) >= len(shared):
+        # sample without replacement; if union smaller than needed (shouldn't if >=), fallback to just union
+        control_removed = set(random.sample(list(all_components), len(shared)))
+    else:
+        control_removed = set()
+
+    control_ablation_train_acc = evaluate_accuracy_with_ablation(
+        model, train_examples, task=task, removed=control_removed, verbose=debug
+    ) if control_removed else baseline_train_acc
+
     if val_examples:
         baseline_val_acc = evaluate_accuracy(model, val_examples, task=task, verbose=debug)
         ablation_val_acc = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=shared, verbose=debug)
+        control_ablation_val_acc = evaluate_accuracy_with_ablation(
+            model, val_examples, task=task, removed=control_removed, verbose=debug
+        ) if control_removed else baseline_val_acc
     else:
         baseline_val_acc = float('nan')
         ablation_val_acc = float('nan')
+        control_ablation_val_acc = float('nan')
 
     metrics = {
         "model_name": model_name,
@@ -144,15 +162,23 @@ def _run_single_combination(
         "ig_steps": steps if method == "ig" else None,
         "baseline_train_accuracy": baseline_train_acc,
         "ablation_train_accuracy": ablation_train_acc,
+        "ablation_control_train_accuracy": control_ablation_train_acc,
         "baseline_val_accuracy": baseline_val_acc,
         "ablation_val_accuracy": ablation_val_acc,
+        "ablation_control_val_accuracy": control_ablation_val_acc,
         "accuracy_drop_train": baseline_train_acc - ablation_train_acc,
         "accuracy_drop_val": (baseline_val_acc - ablation_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
         "accuracy_drop_train_val": baseline_train_acc - ablation_val_acc if not math.isnan(ablation_val_acc) else float('nan'),
+        "accuracy_drop_train_control": baseline_train_acc - control_ablation_train_acc,
+        "accuracy_drop_val_control": (baseline_val_acc - control_ablation_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
+        "accuracy_drop_train_val_control": baseline_train_acc - control_ablation_val_acc if not math.isnan(control_ablation_val_acc) else float('nan'),
         "val_fraction": vf,
         "shared_circuit_size": len(shared),
         "shared_circuit_components": [
             str(c) for c in sorted(shared, key=lambda c: (c.layer, c.kind, c.index))
+        ],
+        "control_circuit_components": [
+            str(c) for c in sorted(control_removed, key=lambda c: (c.layer, c.kind, c.index))
         ],
         "extraction_seconds": end - start,
     }
