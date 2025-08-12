@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
                    help="Display accuracies as percentage (0-100%). (Default: True)")
     p.add_argument("--overlay-scores", action="store_true",
                    help="Overlay baseline and post-removal accuracies as connected markers above bars.")
+    p.add_argument("--no-control", action="store_true",
+                   help="If set, do not plot control ablation results.")
     p.add_argument("--raw", action="store_true",
                    help="Show raw accuracies (0-1). Overrides --percent default.")
     return p.parse_args()
@@ -73,7 +75,7 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
     return df
 
 def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
-             percent: bool, overlay_scores: bool):
+             percent: bool, overlay_scores: bool, include_control: bool):
     if df.empty:
         print("[INFO] No data to plot.")
         return
@@ -98,6 +100,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
 
     sns.set_theme(style="ticks", context="talk", palette="colorblind")
     plt.rcParams.update({"font.family": "serif"})
+    base_palette = sns.color_palette("colorblind")
 
     def _create_plot(sub: pd.DataFrame,
                      baseline_col: str,
@@ -131,11 +134,12 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         # Bars
         labels = ["Baseline", "Ablated"]
         value_arrays = [base_vals, abl_vals]
-        colors = [None, "#ff8888"]
+        # replaced custom hex colors with palette colors
+        colors = [base_palette[0], base_palette[1]]
         if has_control:
             labels.append(control_label)
             value_arrays.append(ctrl_vals)
-            colors.append("#8888ff")
+            colors.append(base_palette[2])
 
         n_bars = len(labels)
         bar_width = 0.8 / n_bars
@@ -148,7 +152,16 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
 
         bar_containers = []
         for off, lab, vals, col in zip(offsets, labels, value_arrays, colors):
-            bc = ax.bar(x + off, vals, bar_width * 0.95, label=lab, color=col, zorder=3, edgecolor=None)
+            bc = ax.bar(
+                x + off,
+                vals,
+                bar_width * 0.95,
+                label=lab,
+                color=col,
+                # zorder=3,
+                edgecolor='none',
+                linewidth=0
+            )
             bar_containers.append(bc)
         
         ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=0)
@@ -179,10 +192,10 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
         
         # Optional overlay
         if overlay_scores:
-            ax.plot(x, base_vals, marker='o', color='black', linewidth=1, label="_nolegend_")
-            ax.plot(x, abl_vals, marker='s', color='gray', linewidth=1, label="_nolegend_")
+            ax.plot(x, base_vals, marker='o', color=base_palette[0], linewidth=1, label="_nolegend_")
+            ax.plot(x, abl_vals, marker='s', color=base_palette[1], linewidth=1, label="_nolegend_")
             if has_control and ctrl_vals is not None:
-                ax.plot(x, ctrl_vals, marker='^', color='#3344aa', linewidth=1, label="_nolegend_")
+                ax.plot(x, ctrl_vals, marker='^', color=base_palette[2], linewidth=1, label="_nolegend_")
         
         ax.set_xlabel("Task")
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
@@ -206,31 +219,30 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
             safe_model = model_disp.replace(" ", "_")
             pretty_method = METHOD_DISPLAY.get(method, method.title())
 
+            suffix = " (includes Control Ablation)" if include_control else ""
             # Train/Train
             _create_plot(
-                sub, 
-                "baseline_train_accuracy_mean", 
+                sub,
+                "baseline_train_accuracy_mean",
                 "ablation_train_accuracy_mean",
-                f"{model_disp} - {pretty_method} Train/Train (includes Control Ablation)", 
+                f"{model_disp} - {pretty_method} Train/Train{suffix}",
                 f"{safe_model}_{method}_train_train.png",
-                control_col="control_train_accuracy_mean",
+                control_col="control_train_accuracy_mean" if include_control else None,
                 control_label="Control Ablation"
             )
-            
             # Val/Val if available
             if sub["baseline_val_accuracy_mean"].notna().any():
                 _create_plot(
-                    sub, 
-                    "baseline_val_accuracy_mean", 
+                    sub,
+                    "baseline_val_accuracy_mean",
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Val/Val (includes Control Ablation)", 
+                    f"{model_disp} - {pretty_method} Val/Val{suffix}",
                     f"{safe_model}_{method}_val_val.png",
-                    control_col="control_val_accuracy_mean",
+                    control_col="control_val_accuracy_mean" if include_control else None,
                     control_label="Control Ablation"
                 )
-            
             # Train/Val if available
-            if (sub["baseline_train_accuracy_mean"].notna().any() and 
+            if (sub["baseline_train_accuracy_mean"].notna().any() and
                 sub["ablation_val_accuracy_mean"].notna().any()):
                 tv = sub[[
                     "model_display", 
@@ -254,12 +266,12 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                 })
 
                 _create_plot(
-                    tv2, 
-                    "baseline_train_accuracy_mean", 
+                    tv2,
+                    "baseline_train_accuracy_mean",
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Train/Val (includes Control Ablation)", 
+                    f"{model_disp} - {pretty_method} Train/Val{suffix}",
                     f"{safe_model}_{method}_train_val.png",
-                    control_col="control_val_accuracy_mean",
+                    control_col="control_val_accuracy_mean" if include_control else None,
                     control_label="Control Ablation"
                 )
 
@@ -301,7 +313,9 @@ def main():
         sort_by=args.sort_by,
         percent=percent,
         overlay_scores=args.overlay_scores,
+        include_control=not args.no_control,
     )
 
 if __name__ == "__main__":
+    main()
     main()
