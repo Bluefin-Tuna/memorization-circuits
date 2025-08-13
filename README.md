@@ -7,7 +7,7 @@ Core idea:
 1. Collect prompt / answer pairs for a simple task.
 2. Attribute component importance (attention heads / MLP blocks).
 3. Find overlap (shared circuit).
-4. Knock it out and measure accuracy drop.
+4. Ablate it and measure accuracy drop.
 
 ## Quick Start
 

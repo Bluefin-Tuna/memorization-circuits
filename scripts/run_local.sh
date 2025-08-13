@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # Define search space
-models=("qwen3-0.6b")
+# models=("qwen3-0.6b")
+models=("gpt2")
 tasks=("addition")
 methods=("gradient")
-top_ks=(100)
+top_ks=(50)
 digits_list=(3)
 num_examples_list=(100)
 steps_for_ig=10
