@@ -18,7 +18,7 @@ python run_experiment.py --model_name gpt2 --task addition --num_examples 50 --m
 
 ## Attribution Methods
 
-- gradient (fast first-order)
+- gradient (fast first-order)Upda
 - ig (integrated gradients, slower, more stable)
 
 ## References / Inspiration

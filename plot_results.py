@@ -289,8 +289,11 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
             safe_model = model_disp.replace(" ", "_")
             pretty_method = METHOD_DISPLAY.get(method, method.title())
 
+            # For each model/method, generate 4 plots: train/train, val/val, train/val, circuit reuse
+
             # Train/Train
             if ("baseline_train_accuracy_mean" in sub.columns) and ("ablation_train_accuracy_mean" in sub.columns):
+                print(f"[PLOT] {model_disp} - {pretty_method} Train/Train")
                 _create_plot(
                     sub,
                     "baseline_train_accuracy_mean",
@@ -303,6 +306,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
 
             # Val/Val if available
             if ("baseline_val_accuracy_mean" in sub.columns) and sub["baseline_val_accuracy_mean"].notna().any():
+                print(f"[PLOT] {model_disp} - {pretty_method} Val/Val")
                 _create_plot(
                     sub,
                     "baseline_val_accuracy_mean",
@@ -316,6 +320,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
             # Train/Val if available (keep error columns intact)
             if ("baseline_train_accuracy_mean" in sub.columns) and sub["baseline_train_accuracy_mean"].notna().any() and \
                ("ablation_val_accuracy_mean" in sub.columns) and sub["ablation_val_accuracy_mean"].notna().any():
+                print(f"[PLOT] {model_disp} - {pretty_method} Train/Val")
                 _create_plot(
                     sub,
                     "baseline_train_accuracy_mean",
@@ -332,6 +337,7 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                 reuse_df = sub[["model_display", "task_display", "method", "shared_circuit_size_mean", "top_k_mean"]].copy()
                 reuse_df = reuse_df[reuse_df["top_k_mean"] > 0]
                 if not reuse_df.empty:
+                    print(f"[PLOT] {model_disp} - {pretty_method} Circuit Reuse")
                     reuse_df["reuse_fraction"] = reuse_df["shared_circuit_size_mean"] / reuse_df["top_k_mean"].clip(lower=1e-9)
                     reuse_df["reuse_plot_value"] = reuse_df["reuse_fraction"] * (100.0 if percent else 1.0)
 
