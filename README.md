@@ -1,6 +1,6 @@
 # Circuit Reuse Experiments
 
-Code for measuring whether small tasks in autoregressive LLMs use shared circuits or memorisation.
+Code for circuit reuse experiments.
 
 Core idea:
 
