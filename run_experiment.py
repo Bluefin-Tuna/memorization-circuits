@@ -44,10 +44,6 @@ def parse_args() -> argparse.Namespace:
                         help="List of digit counts (used only for addition).")
     parser.add_argument("--top_ks", nargs="+", type=int, required=True,
                         help="List of top_k values.")
-    parser.add_argument("--methods", nargs="+", type=str, choices=["gradient", "ig"], required=True,
-                        help="List of attribution methods.")
-    parser.add_argument("--steps", type=int, default=5,
-                        help="Interpolation steps for integrated gradients.")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--debug", action="store_true")
@@ -115,15 +111,13 @@ def _run_single_combination(
     num_examples: int,
     digits: int | None,
     top_k: int,
-    method: str,
-    steps: int,
     device: str,
     debug: bool,
     run_dir: Path,
     amp: bool,
     val_fraction: float,
 ):
-    """Execute one (model, task, num_examples, digits, top_k, method) combo and write outputs into run_dir."""
+    """Execute one (model, task, num_examples, digits, top_k) combo and write outputs into run_dir."""
     # DATASET
     if task == "addition":
         dataset = AdditionDataset(num_examples=num_examples, digits=digits if digits is not None else 2)
@@ -155,10 +149,7 @@ def _run_single_combination(
     )
     for idx, example in enumerate(train_examples):
         with autocast_ctx:
-            if method == "gradient":
-                comp_set = extractor.extract_circuit(example.prompt, example.target)
-            else:
-                comp_set = extractor.extract_circuit_ig(example.prompt, example.target, steps=steps)
+            comp_set = extractor.extract_circuit(example.prompt, example.target)
         circuits.append(comp_set)
         if debug:
             print(f"[EXTRACT {task}] idx={idx} comps={len(comp_set)}")
@@ -191,7 +182,7 @@ def _run_single_combination(
     # CONTROL ABLATION: random components from the full set (heads + MLPs across all layers)
     all_components = _enumerate_all_components(model)
     k = min(len(shared), len(all_components))
-    combo_key = f"{model_name}|{task}|{method}|n{num_examples}|d{digits}|k{top_k}"
+    combo_key = f"{model_name}|{task}|gradient|n{num_examples}|d{digits}|k{top_k}"
     rng_seed = int(hashlib.md5(combo_key.encode("utf-8")).hexdigest()[:8], 16)
     rng = random.Random(rng_seed)
     control_removed = rng.sample(all_components, k) if k > 0 else []
@@ -212,8 +203,7 @@ def _run_single_combination(
         "num_examples": len(dataset),
         "digits": digits if task == "addition" else None,
         "top_k": top_k,
-        "method": method,
-        "ig_steps": steps if method == "ig" else None,
+    "method": "gradient",
 
         "baseline_train_accuracy": baseline_train_acc,
         "baseline_train_correct": baseline_train_correct,
@@ -270,8 +260,7 @@ def _run_single_combination(
             "num_examples": num_examples,
             "digits": digits,
             "top_k": top_k,
-            "method": method,
-            "steps": steps,
+            "method": "gradient",
             "device": device,
             "debug": debug,
         }
@@ -291,7 +280,6 @@ def main() -> None:
 
     print(f"Models: {args.model_names}")
     print(f"Tasks: {args.tasks}")
-    print(f"Methods: {args.methods}")
     print(f"top_ks: {args.top_ks}")
     print(f"digits_list: {args.digits_list}")
     print(f"num_examples_list: {args.num_examples_list}")
@@ -312,11 +300,9 @@ def main() -> None:
     total_runs = 0
     for task in args.tasks:
         if task == "addition":
-            total_runs += (len(args.model_names) * len(args.methods) *
-                           len(args.top_ks) * len(args.digits_list) * len(args.num_examples_list))
+            total_runs += (len(args.model_names) * len(args.top_ks) * len(args.digits_list) * len(args.num_examples_list))
         else:
-            total_runs += (len(args.model_names) * len(args.methods) *
-                           len(args.top_ks) * 1 * len(args.num_examples_list))
+            total_runs += (len(args.model_names) * len(args.top_ks) * 1 * len(args.num_examples_list))
     run_counter = 0
 
     for model_name in args.model_names:
@@ -330,47 +316,44 @@ def main() -> None:
 
         for task in args.tasks:
             digits_iter = args.digits_list if task == "addition" else [None]
-            for method in args.methods:
-                for top_k in args.top_ks:
-                    for digits in digits_iter:
-                        for num_examples in args.num_examples_list:
-                            run_counter += 1
-                            combo_name = (
-                                f"{model_name}__{task}"
-                                f"__n{num_examples}"
-                                f"__d{digits if task=='addition' else 'na'}"
-                                f"__k{top_k}__{method}"
+            for top_k in args.top_ks:
+                for digits in digits_iter:
+                    for num_examples in args.num_examples_list:
+                        run_counter += 1
+                        combo_name = (
+                            f"{model_name}__{task}"
+                            f"__n{num_examples}"
+                            f"__d{digits if task=='addition' else 'na'}"
+                            f"__k{top_k}"
+                        )
+                        run_dir = base_run_dir / combo_name
+                        print(f"\n[RUN {run_counter}/{total_runs}] {combo_name}")
+                        try:
+                            _run_single_combination(
+                                model=model,
+                                model_name=model_name,
+                                task=task,
+                                num_examples=num_examples,
+                                digits=digits,
+                                top_k=top_k,
+                                device=args.device,
+                                debug=args.debug,
+                                run_dir=run_dir,
+                                amp=args.amp,
+                                val_fraction=args.val_fraction,
                             )
-                            run_dir = base_run_dir / combo_name
-                            print(f"\n[RUN {run_counter}/{total_runs}] {combo_name}")
-                            try:
-                                _run_single_combination(
-                                    model=model,
-                                    model_name=model_name,
-                                    task=task,
-                                    num_examples=num_examples,
-                                    digits=digits,
-                                    top_k=top_k,
-                                    method=method,
-                                    steps=args.steps,
-                                    device=args.device,
-                                    debug=args.debug,
-                                    run_dir=run_dir,
-                                    amp=args.amp,
-                                    val_fraction=args.val_fraction,
-                                )
-                            except torch.cuda.OutOfMemoryError as oom:
-                                print(f"[OOM] Skipping {combo_name}: {oom}")
-                            except Exception as e:
-                                print(f"[ERROR] {combo_name} failed: {e}")
-                            finally:
-                                # Release hooks/caches if present
-                                model.reset_hooks()
-                                model.clear_contexts()
-                                model.zero_grad(set_to_none=True)
-                                torch.cuda.empty_cache()
-                                if args.log_mem:
-                                    _print_mem(combo_name)
+                        except torch.cuda.OutOfMemoryError as oom:
+                            print(f"[OOM] Skipping {combo_name}: {oom}")
+                        except Exception as e:
+                            print(f"[ERROR] {combo_name} failed: {e}")
+                        finally:
+                            # Release hooks/caches if present
+                            model.reset_hooks()
+                            model.clear_contexts()
+                            model.zero_grad(set_to_none=True)
+                            torch.cuda.empty_cache()
+                            if args.log_mem:
+                                _print_mem(combo_name)
 
         del model
         torch.cuda.empty_cache()

@@ -12,10 +12,9 @@ import numpy as np
 from scipy import stats
 from circuit_reuse.dataset import get_task_display_name, get_model_display_name
 
-# Method display names
+# Method display names (gradient only)
 METHOD_DISPLAY = {
     "gradient": "Gradient",
-    "ig": "Integrated Gradients",
 }
 
 def parse_args() -> argparse.Namespace:
@@ -66,7 +65,7 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     numeric_cols = [
         "top_k", "shared_circuit_size", "extraction_seconds",
-        "num_examples", "digits", "ig_steps",
+        "num_examples", "digits",
         "baseline_train_accuracy", "ablation_train_accuracy", "control_train_accuracy",
         "baseline_val_accuracy", "ablation_val_accuracy", "control_val_accuracy",
         "accuracy_drop_train", "accuracy_drop_val", "accuracy_drop_train_val",
@@ -121,8 +120,11 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
     }
 
     final_agg_spec = {k: v for k, v in agg_spec.items() if v[0] in df.columns}
+    # If historical runs include other methods, keep only gradient
+    if "method" in df.columns:
+        df = df[df["method"].fillna("gradient") == "gradient"].copy()
     grouped = (df
-               .groupby(["model_display", "task_display", "method"], as_index=False)
+               .groupby(["model_display", "task_display"], as_index=False)
                .agg(**final_agg_spec))
 
     # Calculate accuracies and simple symmetric normal-approximation errors
@@ -149,10 +151,11 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
                     grouped[err_col] = 0.0  # No error bars
 
     if {"top_k", "model_name"}.intersection(df.columns) and \
-       (df[["model_name", "task", "method"]].drop_duplicates().shape[0] != grouped.shape[0]):
+       (df[["model_name", "task"]].drop_duplicates().shape[0] != grouped.shape[0]):
         print("[INFO] Aggregation averaged over varying top_k / model_name.")
 
-    methods = grouped["method"].unique()
+    # Single method (gradient)
+    method = "gradient"
     saved_files: List[str] = []
 
     sns.set_theme(style="ticks", context="talk", palette="colorblind")
@@ -282,100 +285,98 @@ def plot_all(df: pd.DataFrame, out_dir: Path, show: bool, sort_by: str, *,
             plt.show()
         plt.close()
 
-    for method in methods:
-        method_subset = grouped[grouped["method"] == method]
-        for model_disp in sorted(method_subset.model_display.unique()):
-            sub = method_subset[method_subset.model_display == model_disp].copy()
-            safe_model = model_disp.replace(" ", "_")
-            pretty_method = METHOD_DISPLAY.get(method, method.title())
+    for model_disp in sorted(grouped.model_display.unique()):
+        sub = grouped[grouped.model_display == model_disp].copy()
+        safe_model = model_disp.replace(" ", "_")
+        pretty_method = METHOD_DISPLAY.get(method, method.title())
 
             # For each model/method, generate 4 plots: train/train, val/val, train/val, circuit reuse
 
             # Train/Train
-            if ("baseline_train_accuracy_mean" in sub.columns) and ("ablation_train_accuracy_mean" in sub.columns):
-                print(f"[PLOT] {model_disp} - {pretty_method} Train/Train")
-                _create_plot(
-                    sub,
-                    "baseline_train_accuracy_mean",
-                    "ablation_train_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Train/Train",
-                    f"{safe_model}_{method}_train_train.png",
-                    control_col="control_train_accuracy_mean" if include_control and ("control_train_accuracy_mean" in sub.columns) else None,
-                    control_label="Control"
-                )
+        if ("baseline_train_accuracy_mean" in sub.columns) and ("ablation_train_accuracy_mean" in sub.columns):
+            print(f"[PLOT] {model_disp} - {pretty_method} Train/Train")
+            _create_plot(
+                sub,
+                "baseline_train_accuracy_mean",
+                "ablation_train_accuracy_mean",
+                f"{model_disp} - {pretty_method} Train/Train",
+                f"{safe_model}_{method}_train_train.png",
+                control_col="control_train_accuracy_mean" if include_control and ("control_train_accuracy_mean" in sub.columns) else None,
+                control_label="Control"
+            )
 
             # Val/Val if available
-            if ("baseline_val_accuracy_mean" in sub.columns) and sub["baseline_val_accuracy_mean"].notna().any():
-                print(f"[PLOT] {model_disp} - {pretty_method} Val/Val")
-                _create_plot(
-                    sub,
-                    "baseline_val_accuracy_mean",
-                    "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Val/Val",
-                    f"{safe_model}_{method}_val_val.png",
-                    control_col="control_val_accuracy_mean" if include_control and ("control_val_accuracy_mean" in sub.columns) else None,
-                    control_label="Control"
-                )
+        if ("baseline_val_accuracy_mean" in sub.columns) and sub["baseline_val_accuracy_mean"].notna().any():
+            print(f"[PLOT] {model_disp} - {pretty_method} Val/Val")
+            _create_plot(
+                sub,
+                "baseline_val_accuracy_mean",
+                "ablation_val_accuracy_mean",
+                f"{model_disp} - {pretty_method} Val/Val",
+                f"{safe_model}_{method}_val_val.png",
+                control_col="control_val_accuracy_mean" if include_control and ("control_val_accuracy_mean" in sub.columns) else None,
+                control_label="Control"
+            )
 
             # Train/Val if available (keep error columns intact)
-            if ("baseline_train_accuracy_mean" in sub.columns) and sub["baseline_train_accuracy_mean"].notna().any() and \
-               ("ablation_val_accuracy_mean" in sub.columns) and sub["ablation_val_accuracy_mean"].notna().any():
-                print(f"[PLOT] {model_disp} - {pretty_method} Train/Val")
-                _create_plot(
-                    sub,
-                    "baseline_train_accuracy_mean",
-                    "ablation_val_accuracy_mean",
-                    f"{model_disp} - {pretty_method} Train/Val",
-                    f"{safe_model}_{method}_train_val.png",
-                    control_col="control_val_accuracy_mean" if include_control and ("control_val_accuracy_mean" in sub.columns) else None,
-                    control_label="Control"
-                )
+        if ("baseline_train_accuracy_mean" in sub.columns) and sub["baseline_train_accuracy_mean"].notna().any() and \
+           ("ablation_val_accuracy_mean" in sub.columns) and sub["ablation_val_accuracy_mean"].notna().any():
+            print(f"[PLOT] {model_disp} - {pretty_method} Train/Val")
+            _create_plot(
+                sub,
+                "baseline_train_accuracy_mean",
+                "ablation_val_accuracy_mean",
+                f"{model_disp} - {pretty_method} Train/Val",
+                f"{safe_model}_{method}_train_val.png",
+                control_col="control_val_accuracy_mean" if include_control and ("control_val_accuracy_mean" in sub.columns) else None,
+                control_label="Control"
+            )
 
             # Circuit reuse plot (shared circuit size / top_k). Uses train extraction only; no control.
-            if ("shared_circuit_size_mean" in sub.columns and sub["shared_circuit_size_mean"].notna().any()
-                and "top_k_mean" in sub.columns and sub["top_k_mean"].notna().any()):
-                reuse_df = sub[["model_display", "task_display", "method", "shared_circuit_size_mean", "top_k_mean"]].copy()
-                reuse_df = reuse_df[reuse_df["top_k_mean"] > 0]
-                if not reuse_df.empty:
-                    print(f"[PLOT] {model_disp} - {pretty_method} Circuit Reuse")
-                    reuse_df["reuse_fraction"] = reuse_df["shared_circuit_size_mean"] / reuse_df["top_k_mean"].clip(lower=1e-9)
-                    reuse_df["reuse_plot_value"] = reuse_df["reuse_fraction"] * (100.0 if percent else 1.0)
+        if ("shared_circuit_size_mean" in sub.columns and sub["shared_circuit_size_mean"].notna().any()
+            and "top_k_mean" in sub.columns and sub["top_k_mean"].notna().any()):
+            reuse_df = sub[["model_display", "task_display", "shared_circuit_size_mean", "top_k_mean"]].copy()
+            reuse_df = reuse_df[reuse_df["top_k_mean"] > 0]
+            if not reuse_df.empty:
+                print(f"[PLOT] {model_disp} - {pretty_method} Circuit Reuse")
+                reuse_df["reuse_fraction"] = reuse_df["shared_circuit_size_mean"] / reuse_df["top_k_mean"].clip(lower=1e-9)
+                reuse_df["reuse_plot_value"] = reuse_df["reuse_fraction"] * (100.0 if percent else 1.0)
 
-                    if sort_by in {"drop", "baseline", "ablation"}:
-                        reuse_df = reuse_df.sort_values("reuse_plot_value", ascending=False)
-                    else:
-                        reuse_df = reuse_df.sort_values("task_display")
+                if sort_by in {"drop", "baseline", "ablation"}:
+                    reuse_df = reuse_df.sort_values("reuse_plot_value", ascending=False)
+                else:
+                    reuse_df = reuse_df.sort_values("task_display")
 
-                    tasks = list(reuse_df.task_display)
-                    vals = reuse_df["reuse_plot_value"].values
-                    x = np.arange(len(tasks))
-                    fig_w = max(7.0, 0.9 * len(tasks) + 3.0)
-                    fig, ax = plt.subplots(figsize=(fig_w, 5.0))
-                    line_color = sns.color_palette("colorblind")[3 % len(sns.color_palette("colorblind"))]
-                    ax.plot(x, vals, marker="o", linewidth=2, color=line_color)
-                    for xi, v in zip(x, vals):
-                        label = f"{v:.1f}%" if percent else f"{v:.2f}"
-                        ax.annotate(label,
-                                    (xi, v),
-                                    xytext=(0, 6 if percent else 2),
-                                    textcoords="offset points",
-                                    ha="center", va="bottom", fontsize=10)
-                    ax.set_ylabel("Shared Circuit (% of top_k)" if percent else "Shared Circuit Fraction")
-                    ax.set_xlabel("Task")
-                    ylim_top = 100 if percent else 1.0
-                    ypad = 5 if percent else 0.05
-                    ax.set_ylim(0, ylim_top + ypad)
-                    ax.set_xticks(x)
-                    ax.set_xticklabels(tasks, rotation=0)
-                    ax.set_title(f"{model_disp} - {pretty_method} Circuit Reuse")
-                    ax.grid(axis="y", linestyle="--", alpha=0.7)
-                    fig.tight_layout()
-                    reuse_fname = f"{safe_model}_{method}_reuse.png"
-                    plt.savefig(out_dir / reuse_fname, dpi=200, bbox_inches="tight")
-                    saved_files.append(reuse_fname)
-                    if show:
-                        plt.show()
-                    plt.close()
+                tasks = list(reuse_df.task_display)
+                vals = reuse_df["reuse_plot_value"].values
+                x = np.arange(len(tasks))
+                fig_w = max(7.0, 0.9 * len(tasks) + 3.0)
+                fig, ax = plt.subplots(figsize=(fig_w, 5.0))
+                line_color = sns.color_palette("colorblind")[3 % len(sns.color_palette("colorblind"))]
+                ax.plot(x, vals, marker="o", linewidth=2, color=line_color)
+                for xi, v in zip(x, vals):
+                    label = f"{v:.1f}%" if percent else f"{v:.2f}"
+                    ax.annotate(label,
+                                (xi, v),
+                                xytext=(0, 6 if percent else 2),
+                                textcoords="offset points",
+                                ha="center", va="bottom", fontsize=10)
+                ax.set_ylabel("Shared Circuit (% of top_k)" if percent else "Shared Circuit Fraction")
+                ax.set_xlabel("Task")
+                ylim_top = 100 if percent else 1.0
+                ypad = 5 if percent else 0.05
+                ax.set_ylim(0, ylim_top + ypad)
+                ax.set_xticks(x)
+                ax.set_xticklabels(tasks, rotation=0)
+                ax.set_title(f"{model_disp} - {pretty_method} Circuit Reuse")
+                ax.grid(axis="y", linestyle="--", alpha=0.7)
+                fig.tight_layout()
+                reuse_fname = f"{safe_model}_gradient_reuse.png"
+                plt.savefig(out_dir / reuse_fname, dpi=200, bbox_inches="tight")
+                saved_files.append(reuse_fname)
+                if show:
+                    plt.show()
+                plt.close()
 
     print(f"[INFO] Plots written to: {out_dir}")
     print(f"[INFO] Files: {', '.join(saved_files)}")

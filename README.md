@@ -13,13 +13,12 @@ Core idea:
 
 ```bash
 pip install -r requirements.txt
-python run_experiment.py --model_name gpt2 --task addition --num_examples 50 --method gradient
+python run_experiment.py --model_names gpt2 --tasks addition --num_examples_list 50 --digits_list 2 --top_ks 50
 ```
 
 ## Attribution Methods
 
-- gradient (fast first-order)Upda
-- ig (integrated gradients, slower, more stable)
+- gradient (fast first-order)
 
 ## References / Inspiration
 
