@@ -5,9 +5,6 @@ import torch
 from .dataset import ArithmeticExample  # type: ignore
 from .circuit_extraction import Component  # type: ignore
 
-def _predict_next_token_mock(model: Any, prompt: str) -> int:
-    return int(model.predictions.get(prompt, 0))
-
 def _extract_gold_ids(model: Any, prompt: str, target: str, device, verbose: bool = False) -> List[int]:
     """
     Derive gold target token ids robustly even when BPE merges across the prompt/target boundary.
@@ -120,18 +117,8 @@ def _classify_multiple_choice(logits_last: Any, model, verbose: bool = False) ->
         ))
     return best_letter
 
-def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: str, verbose: bool = False, mock: bool = False) -> Tuple[int, int]:
+def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: str, verbose: bool = False) -> Tuple[int, int]:
     """Evaluate accuracy on a dataset for a given task. Returns (correct, total)."""
-    if mock:
-        correct = 0
-        total = 0
-        for ex in dataset:
-            pred_id = _predict_next_token_mock(model, ex.prompt)
-            gold_id = model.to_single_token(ex.target)
-            if pred_id == gold_id:
-                correct += 1
-            total += 1
-        return correct, total
 
     model.eval()
     correct = 0
@@ -157,15 +144,8 @@ def evaluate_accuracy(model: Any, dataset: Iterable[ArithmeticExample], task: st
             total += 1
     return correct, total
 
-def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False, mock: bool = False) -> Tuple[int, int]:
+def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[ArithmeticExample], task: str, removed: Iterable[Component], verbose: bool = False) -> Tuple[int, int]:
     """Evaluate accuracy under component ablation for a specified task. Returns (correct, total)."""
-    if mock:
-        # For mock tests, ablation is a no-op, return perfect accuracy if no components removed.
-        total = len(list(dataset)) if hasattr(dataset, '__len__') else sum(1 for _ in dataset)
-        if not removed:
-            return total, total
-        # Simple mock logic: if any component is removed, assume accuracy drops to 0.
-        return 0, total
 
     model.eval()
     hooks: List[Tuple[str, callable]] = []

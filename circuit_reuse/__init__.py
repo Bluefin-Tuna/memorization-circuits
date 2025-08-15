@@ -1,4 +1,4 @@
-# Package marker for circuit_reuse to enable absolute imports in tests.
+# Package marker for circuit_reuse to enable absolute imports.
 
 from .dataset import *  # noqa: F401,F403
 from .evaluate import *  # noqa: F401,F403
