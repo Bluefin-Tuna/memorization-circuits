@@ -64,7 +64,7 @@ def _run_single_combination(
     top_k: int, device: str, debug: bool, run_dir: Path, amp: bool, val_fraction: float,
 ):
     dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
-    print(f"[{model_name}/{task}] Loaded {len(dataset)} examples.")
+    print(f"[{model_name}/{task}] Generated {len(dataset)} examples.")
 
     extractor = CircuitExtractor(model, top_k=top_k)
 
@@ -79,19 +79,25 @@ def _run_single_combination(
     if debug:
         print(f"[SPLIT] total={n} train={len(train_examples)} val={len(val_examples)} (val_fraction={vf:.2f})")
 
-    circuits: List[set] = []
+    combo_key = f"{model_name}|{task}|eap|n{num_examples}|d{digits}|k{top_k}"
     start = time.time()
-    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16) if amp and device.startswith("cuda") else nullcontext())
+    circuits: List[set] = []
     
-    for idx, example in enumerate(train_examples):
-        with autocast_ctx:
-            comp_set = extractor.extract_circuit(example)
-        circuits.append(comp_set)
-        if debug:
-            print(f"[EXTRACT {task}] idx={idx} comps={len(comp_set)}")
-        if (idx + 1) % 10 == 0 or (idx + 1) == len(train_examples):
-            print(f"[{task}] {idx + 1}/{len(train_examples)} train examples processed (last circuit size={len(comp_set)})")
-        model.zero_grad(set_to_none=True)
+    try:
+        # Instead of looping, we call a single method to process all examples.
+        # This new method will manage memory efficiently internally.
+        circuits = extractor.extract_circuits_from_examples(
+            examples=train_examples,
+            task_name=task,
+            amp=amp,
+            device=device
+        )
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"[OOM] Skipping {combo_key}: CUDA out of memory. {e}")
+        # We can still proceed with an empty circuit list to generate a partial result file.
+    except Exception as e:
+        print(f"[ERROR] Circuit extraction failed for {combo_key}: {e}")
+
     end = time.time()
 
     shared = compute_shared_circuit(circuits)
@@ -113,7 +119,6 @@ def _run_single_combination(
 
     all_components = _enumerate_all_components(model)
     k = min(len(shared), len(all_components))
-    combo_key = f"{model_name}|{task}|eap|n{num_examples}|d{digits}|k{top_k}"
     rng_seed = int(hashlib.md5(combo_key.encode("utf-8")).hexdigest()[:8], 16)
     rng = random.Random(rng_seed)
     control_removed = rng.sample(all_components, k) if k > 0 else []
@@ -161,41 +166,66 @@ def _run_single_combination(
 def main() -> None:
     args = parse_args()
     base_run_dir = _prepare_run_dir(args.output_dir, args.run_name)
-    print(f"Models: {args.model_names}, Tasks: {args.tasks}")
+    if args.log_mem:
+        print(f"Models: {args.model_names}, Tasks: {args.tasks}")
 
     dtype_map = {"bf16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     
-    for model_name in args.model_names:
-        print(f"[MODEL LOAD] Loading model {model_name} (dtype={args.dtype}) on {args.device}...")
-        load_kwargs = {"trust_remote_code": True}
-        if args.dtype != "auto":
-            load_kwargs["torch_dtype"] = dtype_map[args.dtype]
-        model: HookedTransformer = HookedTransformer.from_pretrained(model_name, **load_kwargs)
-        model.to(args.device).eval()
+    total_runs = len(args.model_names) * len(args.tasks) * len(args.top_ks) * (len(args.digits_list) if "addition" in args.tasks else 1) * len(args.num_examples_list)
+    run_count = 0
 
-        for task in args.tasks:
-            digits_iter = args.digits_list if task == "addition" else [None]
-            for top_k in args.top_ks:
-                for digits in digits_iter:
-                    for num_examples in args.num_examples_list:
-                        combo_name = f"{model_name}__{task}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}"
-                        run_dir = base_run_dir / combo_name
-                        print(f"\n[RUN] {combo_name}")
-                        try:
-                            _run_single_combination(
-                                model=model, model_name=model_name, task=task, num_examples=num_examples,
-                                digits=digits, top_k=top_k, device=args.device, debug=args.debug,
-                                run_dir=run_dir, amp=args.amp, val_fraction=args.val_fraction
-                            )
-                        except Exception as e:
-                            print(f"[ERROR] {combo_name} failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        finally:
-                            model.reset_hooks()
-                            torch.cuda.empty_cache()
-        del model
-        torch.cuda.empty_cache()
+    for model_name in args.model_names:
+        model = None
+        try:
+            print(f"[MODEL LOAD] Loading model {model_name} (dtype={args.dtype}) on {args.device}...")
+            load_kwargs = {"trust_remote_code": True}
+            if args.dtype != "auto":
+                load_kwargs["torch_dtype"] = dtype_map[args.dtype]
+            model = HookedTransformer.from_pretrained(model_name, **load_kwargs)
+            model.to(args.device).eval()
+            if args.log_mem:
+                print(f"[MEM] post-load allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
+
+            for task in args.tasks:
+                digits_iter = args.digits_list if task == "addition" else [None]
+                for top_k in args.top_ks:
+                    for digits in digits_iter:
+                        for num_examples in args.num_examples_list:
+                            run_count += 1
+                            combo_name = f"{model_name.replace('/', '_')}__{task}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}"
+                            run_dir = base_run_dir / combo_name
+                            print(f"\n[RUN {run_count}/{total_runs}] {combo_name}")
+                            
+                            try:
+                                _run_single_combination(
+                                    model=model, model_name=model_name, task=task, num_examples=num_examples,
+                                    digits=digits, top_k=top_k, device=args.device, debug=args.debug,
+                                    run_dir=run_dir, amp=args.amp, val_fraction=args.val_fraction
+                                )
+                            except Exception as e:
+                                if "out of memory" in str(e).lower():
+                                     print(f"[OOM] Skipping {combo_name}: {e}")
+                                else:
+                                     print(f"[ERROR] {combo_name} failed: {e}")
+                                     import traceback
+                                     traceback.print_exc()
+                            finally:
+                                if args.log_mem:
+                                    print(f"[MEM] {combo_name} allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
+                                model.reset_hooks()
+
+        except Exception as e:
+            print(f"[FATAL] Failed to process model {model_name}: {e}")
+        finally:
+            # Clean up model and cache after all tasks for it are done
+            if model is not None:
+                del model
+            torch.cuda.empty_cache()
+            if args.log_mem:
+                print(f"[MEM] after-model-del allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
+    
+    print(f"[ALL DONE] Completed {run_count}/{total_runs} runs. Results root: {base_run_dir}")
+
 
 if __name__ == "__main__":
     main()

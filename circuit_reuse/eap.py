@@ -17,7 +17,6 @@ import gc
 import torch
 from torch import Tensor
 from transformer_lens import HookedTransformer
-from transformer_lens.utils import get_attention_mask
 from einops import einsum
 
 
@@ -139,9 +138,7 @@ class Graph:
             return node.layer * total_heads_per_layer + self.cfg["n_heads"] + 2 * self.cfg["n_kv_heads"]
         if isinstance(node, AttentionNode):
             layer_offset = node.layer * total_heads_per_layer
-            # Default to 'v' if qkv not provided
-            if qkv is None:
-                qkv = "v"
+            if qkv is None: qkv = "v" # Default to 'v' if not provided
             if qkv == "q":
                 return layer_offset + node.head
             elif qkv == "k":
@@ -154,15 +151,8 @@ class Graph:
     def from_model(cls, model: HookedTransformer) -> "Graph":
         graph = Graph()
         cfg = model.cfg
-        nkv_heads = getattr(cfg, "n_key_value_heads", None)
-        if nkv_heads is None:
-            nkv_heads = cfg.n_heads
-
-        graph.cfg = {
-            "n_layers": cfg.n_layers,
-            "n_heads": cfg.n_heads,
-            "n_kv_heads": nkv_heads,
-        }
+        nkv_heads = getattr(cfg, "n_key_value_heads", cfg.n_heads)
+        graph.cfg = {"n_layers": cfg.n_layers, "n_heads": cfg.n_heads, "n_kv_heads": nkv_heads}
 
         nodes: List[Node] = [InputNode()]
         for layer in range(cfg.n_layers):
@@ -183,7 +173,6 @@ class Graph:
                             (isinstance(parent_node, AttentionNode) and isinstance(child_node, MLPNode) and parent_node.layer == child_node.layer) or \
                             isinstance(child_node, LogitNode)
                 if not is_causal: continue
-
                 if isinstance(child_node, AttentionNode):
                     for letter in "qkv":
                         graph.edges[Edge(parent_node, child_node, qkv=letter).name] = True
@@ -203,34 +192,33 @@ class Edge:
         self.name = f"{parent.name}->{child.name}" + (f"<{qkv}>" if qkv else "")
 
 
-def make_hooks_and_matrices(
-    model: HookedTransformer, graph: Graph, activation_difference: Tensor, scores: Tensor
-):
+def make_hooks(model: HookedTransformer, graph: Graph, activation_difference: Tensor, scores: Tensor):
+    
     def activation_hook(index, activations, hook, add: bool = True, head_index: Optional[int] = None):
+        seq_len = activations.shape[1]
         acts = activations.detach()
-        # For attention result hooks, select the single head contribution
         if head_index is not None and acts.ndim == 4:
-            # [batch, pos, n_heads, d_model] -> [batch, pos, d_model]
             acts = acts[:, :, head_index, :]
-        if not add:
-            acts = -acts
-        # [batch, pos, d_model]
-        activation_difference[:, :, index, :] += acts
+        
+        # Write into the slice of the pre-allocated tensor
+        if add:
+            activation_difference[:, :seq_len, index, :] += acts
+        else:
+            activation_difference[:, :seq_len, index, :] -= acts
 
     def gradient_hook(prev_index: int, bwd_index_slice: slice, gradients: Tensor, hook):
+        seq_len = gradients.shape[1]
         grads = gradients.detach()
-        # Ensure grads has shape [batch, pos, d_model]
-        # Some hooks (like attn result) produce [batch, pos, n_heads, d_model] or [batch, pos, d_head]
-        # We only register gradient hooks on resid-level inputs to guarantee d_model alignment.
         if grads.ndim == 4:
-            # If the gradient unexpectedly has a head dimension, sum over it.
             grads = grads.sum(dim=2)
         if grads.ndim == 3:
-            # Add singleton bwd dimension to align with activation_difference einsum pattern
             grads = grads.unsqueeze(2)
-
+        
+        # Use the corresponding slice of the activation_difference tensor
+        act_diff_slice = activation_difference[:, :seq_len, :prev_index]
+        
         s = einsum(
-            activation_difference[:, :, :prev_index], grads,
+            act_diff_slice, grads,
             "batch pos fwd hidden, batch pos bwd hidden -> fwd bwd",
         )
         scores[:prev_index, bwd_index_slice] += s
@@ -240,70 +228,51 @@ def make_hooks_and_matrices(
     for name, node in graph.nodes.items():
         if not isinstance(node, LogitNode):
             fwd_idx = graph.forward_index(node)
-            if isinstance(node, AttentionNode):
-                # Pass head index to select the correct head from hook_result
-                fwd_hooks_corrupted.append((node.out_hook, partial(activation_hook, fwd_idx, add=True, head_index=node.head)))
-                fwd_hooks_clean.append((node.out_hook, partial(activation_hook, fwd_idx, add=False, head_index=node.head)))
-            else:
-                fwd_hooks_corrupted.append((node.out_hook, partial(activation_hook, fwd_idx, add=True)))
-                fwd_hooks_clean.append((node.out_hook, partial(activation_hook, fwd_idx, add=False)))
+            head_idx = node.head if isinstance(node, AttentionNode) else None
+            fwd_hooks_corrupted.append((node.out_hook, partial(activation_hook, fwd_idx, add=True, head_index=head_idx)))
+            fwd_hooks_clean.append((node.out_hook, partial(activation_hook, fwd_idx, add=False, head_index=head_idx)))
 
         if not isinstance(node, InputNode):
             prev_idx = graph.prev_index(node)
             if isinstance(node, AttentionNode):
-                # Register a single resid-level backward hook per attention layer
-                if node.layer in processed_attn_layers:
-                    continue
+                if node.layer in processed_attn_layers: continue
                 processed_attn_layers.add(node.layer)
-                bwd_idx = graph.backward_index(node, None)
-                bwd_hooks.append((node.in_hook, partial(gradient_hook, prev_idx, slice(bwd_idx, bwd_idx + 1))))
-            else:
-                bwd_idx = graph.backward_index(node, None)
-                bwd_hooks.append((node.in_hook, partial(gradient_hook, prev_idx, slice(bwd_idx, bwd_idx + 1))))
+            bwd_idx = graph.backward_index(node, None)
+            bwd_hooks.append((node.in_hook, partial(gradient_hook, prev_idx, slice(bwd_idx, bwd_idx + 1))))
+            
     return fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks
 
 
-def get_scores_eap(model, graph, dataloader, metric, quiet=False):
+def attribute_single_example(
+    model: HookedTransformer,
+    graph: Graph,
+    metric: Callable,
+    clean_tokens: Tensor,
+    corrupted_tokens: Tensor,
+    activation_difference: Tensor,
+) -> Tensor:
+    """
+    Runs EAP for a single example, reusing a pre-allocated activation_difference tensor.
+    """
     scores = torch.zeros((graph.n_forward, graph.n_backward), device=model.cfg.device, dtype=model.cfg.dtype)
-    total_items = 0
     
-    first_clean, _, _ = next(iter(dataloader))
-    batch_size, n_pos = first_clean[0].shape[0], first_clean[3]
-    activation_difference = torch.zeros(
-        (batch_size, n_pos, graph.n_forward, model.cfg.d_model),
-        device=model.cfg.device, dtype=model.cfg.dtype,
-    )
+    # IMPORTANT: Reset the reusable tensor before processing the new example
+    activation_difference.zero_()
 
-    fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks = make_hooks_and_matrices(
+    fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks = make_hooks(
         model, graph, activation_difference, scores
     )
 
-    for clean, corrupted, label in dataloader:
-        clean_tokens, clean_attention_mask, input_lengths, _ = clean
-        corrupted_tokens, corrupted_attention_mask, _, _ = corrupted
-        total_items += clean_tokens.shape[0]
+    with torch.no_grad():
+        with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+            model(corrupted_tokens)
 
-        with torch.no_grad():
-            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
-                model(corrupted_tokens, attention_mask=corrupted_attention_mask)
+    with model.hooks(fwd_hooks=fwd_hooks_clean, bwd_hooks=bwd_hooks):
+        logits = model(clean_tokens)
+        metric_value = metric(logits, None, None, None)
+        metric_value.backward()
+    
+    model.zero_grad(set_to_none=True)
+    model.reset_hooks()
 
-        with model.hooks(fwd_hooks=fwd_hooks_clean, bwd_hooks=bwd_hooks):
-            logits = model(clean_tokens, attention_mask=clean_attention_mask)
-            metric_value = metric(logits, None, input_lengths, label)
-            metric_value.backward()
-        
-        model.zero_grad()
-        activation_difference.zero_()
-
-    del activation_difference
-    if torch.cuda.is_available():
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    return (scores / total_items).cpu()
-
-
-def attribute(model: HookedTransformer, graph: Graph, dataloader, metric, method="EAP", quiet=False):
-    if method == "EAP":
-        return get_scores_eap(model, graph, dataloader, metric, quiet=quiet)
-    raise ValueError(f"Unsupported method: {method}")
+    return scores.cpu()

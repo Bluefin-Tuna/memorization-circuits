@@ -4,8 +4,10 @@ from dataclasses import dataclass
 import torch
 from torch.nn import functional as F
 from transformer_lens import HookedTransformer
+from contextlib import nullcontext
+import gc
 
-from .eap import Graph, attribute
+from .eap import Graph, attribute_single_example
 from .dataset import Example
 
 
@@ -64,68 +66,88 @@ class CircuitExtractor:
                 component_scores[comp] = score
         return component_scores
 
-    def extract_circuit(self, example: Example) -> Set[Component]:
-        # Tokenize prompt and full prompt+target for principled multi-token metric
+    def _prepare_eap_inputs(self, example: Example):
+        """Prepares and tokenizes a single example for EAP."""
         prompt_tok = self.model.to_tokens(example.prompt, prepend_bos=True)
         clean_full_tok = self.model.to_tokens(example.prompt + example.target, prepend_bos=True)
         corrupted_full_tok = self.model.to_tokens(example.corrupted_prompt + example.corrupted_target, prepend_bos=True)
 
-        # Derive target token IDs after the prompt boundary
         device = self.model.cfg.device
-        # Local derivation to avoid circular import: get tokens in full vs prompt and take the suffix
-        p_ids = prompt_tok.to(device)[0].tolist()
-        f_ids = clean_full_tok.to(device)[0].tolist()
+        p_ids, f_ids = prompt_tok.tolist()[0], clean_full_tok.tolist()[0]
         lcp = 0
-        for a, b in zip(p_ids, f_ids):
-            if a == b:
-                lcp += 1
-            else:
-                break
-        gold_ids_list = f_ids[lcp:] if lcp < len(f_ids) else self.model.to_tokens(example.target, prepend_bos=False).to(device)[0].tolist()
+        while lcp < len(p_ids) and lcp < len(f_ids) and p_ids[lcp] == f_ids[lcp]:
+            lcp += 1
+        
+        gold_ids_list = f_ids[lcp:] if lcp < len(f_ids) else self.model.to_tokens(example.target, prepend_bos=False).tolist()[0]
         target_ids = torch.tensor(gold_ids_list, device=device, dtype=torch.long)
         prompt_len = prompt_tok.shape[1]
         positions = torch.arange(prompt_len - 1, prompt_len - 1 + len(gold_ids_list), device=device, dtype=torch.long)
 
-        # Pad clean/corrupted sequences to the same length
         max_len = max(clean_full_tok.shape[1], corrupted_full_tok.shape[1])
         pad_token = self.model.tokenizer.pad_token_id if self.model.tokenizer.pad_token_id is not None else self.model.tokenizer.eos_token_id
 
-        clean_padding = (max_len - clean_full_tok.shape[1], 0)
-        clean_tokens = F.pad(clean_full_tok, clean_padding, "constant", pad_token)
-        clean_attention_mask = (clean_tokens != pad_token).long()
-        # Not used by metric anymore, but keep shape for API compatibility
-        clean_input_lengths = torch.tensor([clean_full_tok.shape[1]], device=clean_tokens.device)
+        clean_padding = (0, max_len - clean_full_tok.shape[1])
+        clean_tokens = F.pad(clean_full_tok, clean_padding, "constant", pad_token).to(device)
+        
+        corrupted_padding = (0, max_len - corrupted_full_tok.shape[1])
+        corrupted_tokens = F.pad(corrupted_full_tok, corrupted_padding, "constant", pad_token).to(device)
 
-        corrupted_padding = (max_len - corrupted_full_tok.shape[1], 0)
-        corrupted_tokens = F.pad(corrupted_full_tok, corrupted_padding, "constant", pad_token)
-        corrupted_attention_mask = (corrupted_tokens != pad_token).long()
-
-        # Build metric for multi-token targets
         metric = self._get_metric_fn(positions=positions, target_ids=target_ids)
+        
+        return clean_tokens, corrupted_tokens, metric, max_len
+        
+    def extract_circuits_from_examples(self, examples: List[Example], task_name: str, amp: bool, device: str) -> List[Set[Component]]:
+        """
+        Extracts circuits for a list of examples using EAP with efficient memory management.
+        The large activation tensor is allocated once and reused.
+        """
+        circuits = []
+        autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16) if amp and device.startswith("cuda") else nullcontext())
+        
+        # Determine max sequence length across all examples to allocate the buffer once
+        max_seq_len = 0
+        all_tokenized = [self._prepare_eap_inputs(ex) for ex in examples]
+        for clean_tokens, corrupted_tokens, _, _ in all_tokenized:
+            max_seq_len = max(max_seq_len, clean_tokens.shape[1], corrupted_tokens.shape[1])
 
-        dataloader = [
-            (
-                (clean_tokens.to(device), clean_attention_mask.to(device), clean_input_lengths.to(device), max_len),
-                (corrupted_tokens.to(device), corrupted_attention_mask.to(device), None, None),
-                (positions, target_ids),
-            )
-        ]
-
-        scores = attribute(
-            model=self.model,
-            graph=self.graph,
-            dataloader=dataloader,
-            metric=metric,
-            method="EAP",
-            quiet=True,
+        # Allocate the large tensor ONCE.
+        activation_difference = torch.zeros(
+            (1, max_seq_len, self.graph.n_forward, self.model.cfg.d_model),
+            device=self.model.cfg.device, dtype=self.model.cfg.dtype,
         )
 
-        component_scores = self._scores_to_components(scores)
-        items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
+        for idx, (clean_tokens, corrupted_tokens, metric, seq_len) in enumerate(all_tokenized):
+            with autocast_ctx:
+                # Pad current example tokens to the max sequence length of the buffer
+                clean_pad = (0, max_seq_len - clean_tokens.shape[1])
+                corrupted_pad = (0, max_seq_len - corrupted_tokens.shape[1])
+                clean_tokens_padded = F.pad(clean_tokens, clean_pad, "constant", 0)
+                corrupted_tokens_padded = F.pad(corrupted_tokens, corrupted_pad, "constant", 0)
+                
+                # Pass the pre-allocated tensor to the attribution function
+                scores = attribute_single_example(
+                    model=self.model,
+                    graph=self.graph,
+                    metric=metric,
+                    clean_tokens=clean_tokens_padded,
+                    corrupted_tokens=corrupted_tokens_padded,
+                    activation_difference=activation_difference,
+                )
+            
+            component_scores = self._scores_to_components(scores)
+            items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
+            comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
+            circuits.append(comp_set)
 
-        if self.top_k is not None:
-            items = items[: self.top_k]
-        return {c for c, _ in items}
+            if (idx + 1) % 10 == 0 or (idx + 1) == len(examples):
+                print(f"[{task_name}] {idx + 1}/{len(examples)} train examples processed (last circuit size={len(comp_set)})")
+
+        # Cleanup
+        del activation_difference
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return circuits
 
 
 def compute_shared_circuit(circuits: List[Set[Component]]) -> Set[Component]:
