@@ -12,12 +12,14 @@ import hashlib
 import torch
 from transformer_lens import HookedTransformer
 
-from circuit_reuse.dataset import AdditionDataset, get_dataset
+from circuit_reuse.dataset import get_dataset, Example
 from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit, Component
 from circuit_reuse.evaluate import evaluate_accuracy, evaluate_accuracy_with_ablation
 
+
 def _default_run_name():
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
 
 def _prepare_run_dir(output_dir: str, run_name: str | None):
     base = Path(output_dir)
@@ -27,139 +29,74 @@ def _prepare_run_dir(output_dir: str, run_name: str | None):
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
+
 def parse_args() -> argparse.Namespace:
-    """Parse CLI args (modern multi-run only)."""
     parser = argparse.ArgumentParser(description="Circuit reuse experiment (multi-run only)")
-    # ONLY list-based args now
-    parser.add_argument("--model_names", nargs="+", type=str, required=True,
-                        help="List of model names.")
-    parser.add_argument("--tasks", nargs="+", type=str, required=True,
-                        help="List of tasks.")
-    parser.add_argument("--num_examples_list", nargs="+", type=int, required=True,
-                        help="List of num_examples values.")
-    parser.add_argument("--digits_list", nargs="+", type=int, required=True,
-                        help="List of digit counts (used only for addition).")
-    parser.add_argument("--top_ks", nargs="+", type=int, required=True,
-                        help="List of top_k values.")
-    parser.add_argument("--device", type=str,
-                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--model_names", nargs="+", type=str, required=True, help="List of model names.")
+    parser.add_argument("--tasks", nargs="+", type=str, required=True, help="List of tasks.")
+    parser.add_argument("--num_examples_list", nargs="+", type=int, required=True, help="List of num_examples values.")
+    parser.add_argument("--digits_list", nargs="+", type=int, required=True, help="List of digit counts (used only for addition).")
+    parser.add_argument("--top_ks", nargs="+", type=int, required=True, help="List of top_k values.")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results")
     parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument("--dtype", type=str, default="auto",
-                        choices=["auto", "bf16", "float16", "float32"],
-                        help="Model/load dtype to reduce memory (bf16 recommended).")
-    parser.add_argument("--log-mem", action="store_true",
-                        help="Print CUDA memory after each combo.")
-    parser.add_argument("--amp", action="store_true",
-                        help="Use autocast (mixed precision) during extraction.")
-    parser.add_argument("--val-fraction", type=float, default=0.2,
-                        help="Fraction of dataset held out for validation evaluation (NOT used for circuit extraction). 0 disables validation.")
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "float16", "float32"], help="Model/load dtype to reduce memory (bf16 recommended).")
+    parser.add_argument("--log-mem", action="store_true", help="Print CUDA memory after each combo.")
+    parser.add_argument("--amp", action="store_true", help="Use autocast (mixed precision) during extraction.")
+    parser.add_argument("--val-fraction", type=float, default=0.2, help="Fraction of dataset held out for validation evaluation (NOT used for circuit extraction). 0 disables validation.")
     return parser.parse_args()
 
-def _enumerate_all_components(model: HookedTransformer) -> List[Component]:
-    """
-    Enumerate the full set of model components eligible for ablation:
-    all attention heads and all MLPs across all layers.
-    """
-    # Primary metadata from config; provide fallbacks in case attributes differ
-    try:
-        n_layers = int(getattr(model.cfg, "n_layers", len(getattr(model, "blocks", []))))
-    except Exception:
-        n_layers = len(getattr(model, "blocks", []))
-    # Some models may expose n_heads_kv (grouped query attention). We only ablate standard heads actually produced
-    # in attn.hook_result which has shape [..., n_heads, d_head]. So prefer cfg.n_heads.
-    n_heads = int(getattr(model.cfg, "n_heads", 0))
-    if n_layers == 0 or n_heads == 0:
-        # Best-effort inference from first attention module if possible
-        try:
-            first_attn = getattr(model.blocks[0], "attn", None)
-            if first_attn is not None and hasattr(first_attn, "num_heads"):
-                n_heads = n_heads or int(first_attn.num_heads)
-            if n_layers == 0:
-                n_layers = len(model.blocks)
-        except Exception:
-            pass
 
+def _enumerate_all_components(model: HookedTransformer) -> List[Component]:
+    n_layers = model.cfg.n_layers
+    n_heads = model.cfg.n_heads
     comps: List[Component] = []
     for layer in range(n_layers):
-        # Attention heads
         for h in range(n_heads):
             comps.append(Component(layer=layer, kind="head", index=h))
-        # One MLP block per layer (transformer-lens exposes a single MLP per layer)
         comps.append(Component(layer=layer, kind="mlp", index=0))
-
-    # Sanity: ensure uniqueness (should already hold due to dataclass hash)
-    # but guard against accidental duplicates if logic changes.
-    if len(set(comps)) != len(comps):  # pragma: no cover - defensive
-        seen = set()
-        deduped = []
-        for c in comps:
-            if c not in seen:
-                seen.add(c)
-                deduped.append(c)
-        comps = deduped
     return comps
 
+
 def _run_single_combination(
-    model: HookedTransformer,
-    model_name: str,
-    task: str,
-    num_examples: int,
-    digits: int | None,
-    top_k: int,
-    device: str,
-    debug: bool,
-    run_dir: Path,
-    amp: bool,
-    val_fraction: float,
+    model: HookedTransformer, model_name: str, task: str, num_examples: int, digits: int | None,
+    top_k: int, device: str, debug: bool, run_dir: Path, amp: bool, val_fraction: float,
 ):
-    """Execute one (model, task, num_examples, digits, top_k) combo and write outputs into run_dir."""
-    # DATASET
-    if task == "addition":
-        dataset = AdditionDataset(num_examples=num_examples, digits=digits if digits is not None else 2)
-        print(f"[{model_name}/{task}] Generated {len(dataset)} examples (digits={digits}).")
-    else:
-        dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
-        print(f"[{model_name}/{task}] Loaded {len(dataset)} examples.")
+    dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
+    print(f"[{model_name}/{task}] Loaded {len(dataset)} examples.")
 
     extractor = CircuitExtractor(model, top_k=top_k)
 
-    # Train/validation split (validation only for evaluation)
     examples = list(dataset)
+    random.shuffle(examples)
     n = len(examples)
-    vf = max(0.0, min(0.9, val_fraction))  # clamp
+    vf = max(0.0, min(0.9, val_fraction))
     val_count = int(round(vf * n)) if vf > 0 else 0
-    if val_count >= n and n > 1:
-        val_count = n - 1
+    if val_count >= n and n > 1: val_count = n - 1
     train_examples = examples[: n - val_count]
-    val_examples = examples[n - val_count:]
+    val_examples = examples[n - val_count :]
     if debug:
         print(f"[SPLIT] total={n} train={len(train_examples)} val={len(val_examples)} (val_fraction={vf:.2f})")
 
     circuits: List[set] = []
     start = time.time()
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if amp and device.startswith("cuda")
-        else nullcontext()
-    )
+    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16) if amp and device.startswith("cuda") else nullcontext())
+    
     for idx, example in enumerate(train_examples):
         with autocast_ctx:
-            comp_set = extractor.extract_circuit(example.prompt, example.target)
+            comp_set = extractor.extract_circuit(example)
         circuits.append(comp_set)
         if debug:
             print(f"[EXTRACT {task}] idx={idx} comps={len(comp_set)}")
         if (idx + 1) % 10 == 0 or (idx + 1) == len(train_examples):
-            print(f"[{task}] {idx + 1}/{len(train_examples)} train examples (last circuit size={len(comp_set)})")
-        # free intermediate grads right away
+            print(f"[{task}] {idx + 1}/{len(train_examples)} train examples processed (last circuit size={len(comp_set)})")
         model.zero_grad(set_to_none=True)
     end = time.time()
 
     shared = compute_shared_circuit(circuits)
     print(f"[{task}] Shared circuit size={len(shared)} (top_k per example={top_k}).")
 
-    # Baseline and shared-circuit ablation metrics
     baseline_train_correct, baseline_train_total = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
     baseline_train_acc = baseline_train_correct / baseline_train_total if baseline_train_total > 0 else 0.0
     ablation_train_correct, ablation_train_total = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=shared, verbose=debug)
@@ -171,15 +108,12 @@ def _run_single_combination(
         ablation_val_correct, ablation_val_total = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=shared, verbose=debug)
         ablation_val_acc = ablation_val_correct / ablation_val_total if ablation_val_total > 0 else 0.0
     else:
-        baseline_val_correct, baseline_val_total = 0, 0
-        baseline_val_acc = float('nan')
-        ablation_val_correct, ablation_val_total = 0, 0
-        ablation_val_acc = float('nan')
+        baseline_val_correct, baseline_val_total, ablation_val_correct, ablation_val_total = 0, 0, 0, 0
+        baseline_val_acc, ablation_val_acc = float('nan'), float('nan')
 
-    # CONTROL ABLATION: random components from the full set (heads + MLPs across all layers)
     all_components = _enumerate_all_components(model)
     k = min(len(shared), len(all_components))
-    combo_key = f"{model_name}|{task}|gradient|n{num_examples}|d{digits}|k{top_k}"
+    combo_key = f"{model_name}|{task}|eap|n{num_examples}|d{digits}|k{top_k}"
     rng_seed = int(hashlib.md5(combo_key.encode("utf-8")).hexdigest()[:8], 16)
     rng = random.Random(rng_seed)
     control_removed = rng.sample(all_components, k) if k > 0 else []
@@ -195,169 +129,73 @@ def _run_single_combination(
         control_val_acc = float('nan')
 
     metrics = {
-        "model_name": model_name,
-        "task": task,
-        "num_examples": len(dataset),
-        "digits": digits if task == "addition" else None,
-        "top_k": top_k,
-        "method": "gradient",
-
-        "baseline_train_accuracy": baseline_train_acc,
-        "baseline_train_correct": baseline_train_correct,
-        "baseline_train_total": baseline_train_total,
-        "ablation_train_accuracy": ablation_train_acc,
-        "ablation_train_correct": ablation_train_correct,
-        "ablation_train_total": ablation_train_total,
-
-        "baseline_val_accuracy": baseline_val_acc,
-        "baseline_val_correct": baseline_val_correct,
-        "baseline_val_total": baseline_val_total,
-        "ablation_val_accuracy": ablation_val_acc,
-        "ablation_val_correct": ablation_val_correct,
-        "ablation_val_total": ablation_val_total,
-
+        "model_name": model_name, "task": task, "num_examples": len(dataset),
+        "digits": digits if task == "addition" else None, "top_k": top_k, "method": "eap",
+        "baseline_train_accuracy": baseline_train_acc, "baseline_train_correct": baseline_train_correct,
+        "baseline_train_total": baseline_train_total, "ablation_train_accuracy": ablation_train_acc,
+        "ablation_train_correct": ablation_train_correct, "ablation_train_total": ablation_train_total,
+        "baseline_val_accuracy": baseline_val_acc, "baseline_val_correct": baseline_val_correct,
+        "baseline_val_total": baseline_val_total, "ablation_val_accuracy": ablation_val_acc,
+        "ablation_val_correct": ablation_val_correct, "ablation_val_total": ablation_val_total,
         "accuracy_drop_train": baseline_train_acc - ablation_train_acc,
         "accuracy_drop_val": (baseline_val_acc - ablation_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
         "accuracy_drop_train_val": baseline_train_acc - ablation_val_acc if not math.isnan(ablation_val_acc) else float('nan'),
-        "val_fraction": vf,
-        "shared_circuit_size": len(shared),
-        "shared_circuit_components": [
-            str(c) for c in sorted(shared, key=lambda c: (c.layer, c.kind, c.index))
-        ],
-        "extraction_seconds": end - start,
-
-        # Control ablation metrics
-        "control_train_accuracy": control_train_acc,
-        "control_train_correct": control_train_correct,
-        "control_train_total": control_train_total,
-        "control_val_accuracy": control_val_acc,
-        "control_val_correct": control_val_correct,
-        "control_val_total": control_val_total,
-        "control_accuracy_drop_train": baseline_train_acc - control_train_acc,
+        "val_fraction": vf, "shared_circuit_size": len(shared),
+        "shared_circuit_components": [str(c) for c in sorted(shared, key=lambda c: (c.layer, c.kind, c.index))],
+        "extraction_seconds": end - start, "control_train_accuracy": control_train_acc,
+        "control_train_correct": control_train_correct, "control_train_total": control_train_total,
+        "control_val_accuracy": control_val_acc, "control_val_correct": control_val_correct,
+        "control_val_total": control_val_total, "control_accuracy_drop_train": baseline_train_acc - control_train_acc,
         "control_accuracy_drop_val": (baseline_val_acc - control_val_acc) if not math.isnan(baseline_val_acc) else float('nan'),
         "control_accuracy_drop_train_val": baseline_train_acc - control_val_acc if not math.isnan(control_val_acc) else float('nan'),
-        "control_removed_components": [
-            str(c) for c in sorted(control_removed, key=lambda c: (c.layer, c.kind, c.index))
-        ],
-        "control_rng_seed": rng_seed,
-        "control_total_component_count": len(all_components),
+        "control_removed_components": [str(c) for c in sorted(control_removed, key=lambda c: (c.layer, c.kind, c.index))],
+        "control_rng_seed": rng_seed, "control_total_component_count": len(all_components),
     }
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with (run_dir / "metrics.json").open("w") as f:
-            json.dump(metrics, f, indent=2, sort_keys=True)
-    except Exception as e:
-        print(f"[WARN] Failed to write metrics.json in {run_dir}: {e}")
-
-    try:
-        config = {
-            "model_name": model_name,
-            "task": task,
-            "num_examples": num_examples,
-            "digits": digits,
-            "top_k": top_k,
-            "method": "gradient",
-            "device": device,
-            "debug": debug,
-        }
-        with (run_dir / "config.json").open("w") as f:
-            json.dump(config, f, indent=2, sort_keys=True)
-    except Exception as e:
-        print(f"[WARN] Failed to write config.json in {run_dir}: {e}")
-
+    with (run_dir / "metrics.json").open("w") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
     print(f"[DONE] {run_dir}")
-    return metrics
+
 
 def main() -> None:
-    """Run experiment end-to-end (single or multi-run)."""
     args = parse_args()
-
     base_run_dir = _prepare_run_dir(args.output_dir, args.run_name)
+    print(f"Models: {args.model_names}, Tasks: {args.tasks}")
 
-    print(f"Models: {args.model_names}")
-    print(f"Tasks: {args.tasks}")
-    print(f"top_ks: {args.top_ks}")
-    print(f"digits_list: {args.digits_list}")
-    print(f"num_examples_list: {args.num_examples_list}")
-
-    dtype_map = {
-        "bf16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }
-
-    def _print_mem(prefix: str):
-        if not torch.cuda.is_available():
-            return
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"[MEM] {prefix} allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB")
-
-    total_runs = 0
-    for task in args.tasks:
-        if task == "addition":
-            total_runs += (len(args.model_names) * len(args.top_ks) * len(args.digits_list) * len(args.num_examples_list))
-        else:
-            total_runs += (len(args.model_names) * len(args.top_ks) * 1 * len(args.num_examples_list))
-    run_counter = 0
-
+    dtype_map = {"bf16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+    
     for model_name in args.model_names:
         print(f"[MODEL LOAD] Loading model {model_name} (dtype={args.dtype}) on {args.device}...")
         load_kwargs = {"trust_remote_code": True}
         if args.dtype != "auto":
-            load_kwargs["dtype"] = dtype_map[args.dtype]
+            load_kwargs["torch_dtype"] = dtype_map[args.dtype]
         model: HookedTransformer = HookedTransformer.from_pretrained(model_name, **load_kwargs)
         model.to(args.device).eval()
-        _print_mem("post-load")
 
         for task in args.tasks:
             digits_iter = args.digits_list if task == "addition" else [None]
             for top_k in args.top_ks:
                 for digits in digits_iter:
                     for num_examples in args.num_examples_list:
-                        run_counter += 1
-                        combo_name = (
-                            f"{model_name}__{task}"
-                            f"__n{num_examples}"
-                            f"__d{digits if task=='addition' else 'na'}"
-                            f"__k{top_k}"
-                        )
+                        combo_name = f"{model_name}__{task}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}"
                         run_dir = base_run_dir / combo_name
-                        print(f"\n[RUN {run_counter}/{total_runs}] {combo_name}")
+                        print(f"\n[RUN] {combo_name}")
                         try:
                             _run_single_combination(
-                                model=model,
-                                model_name=model_name,
-                                task=task,
-                                num_examples=num_examples,
-                                digits=digits,
-                                top_k=top_k,
-                                device=args.device,
-                                debug=args.debug,
-                                run_dir=run_dir,
-                                amp=args.amp,
-                                val_fraction=args.val_fraction,
+                                model=model, model_name=model_name, task=task, num_examples=num_examples,
+                                digits=digits, top_k=top_k, device=args.device, debug=args.debug,
+                                run_dir=run_dir, amp=args.amp, val_fraction=args.val_fraction
                             )
-                        except torch.cuda.OutOfMemoryError as oom:
-                            print(f"[OOM] Skipping {combo_name}: {oom}")
                         except Exception as e:
                             print(f"[ERROR] {combo_name} failed: {e}")
+                            import traceback
+                            traceback.print_exc()
                         finally:
-                            # Release hooks/caches if present
                             model.reset_hooks()
-                            model.clear_contexts()
-                            model.zero_grad(set_to_none=True)
                             torch.cuda.empty_cache()
-                            if args.log_mem:
-                                _print_mem(combo_name)
-
         del model
         torch.cuda.empty_cache()
-        if args.log_mem:
-            _print_mem("after-model-del")
-
-    print(f"[ALL DONE] Completed {run_counter}/{total_runs} runs. Results root: {base_run_dir.resolve()}")
 
 if __name__ == "__main__":
     main()

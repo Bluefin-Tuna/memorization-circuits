@@ -1,108 +1,140 @@
 from __future__ import annotations
-
-from typing import Dict, List, Set, Tuple, Any, Optional
+from typing import Dict, List, Set, Any, Optional
 from dataclasses import dataclass
-
 import torch
+from torch.nn import functional as F
 from transformer_lens import HookedTransformer
+
+from .eap import Graph, attribute
+from .dataset import Example
+
 
 @dataclass(frozen=True)
 class Component:
-	layer: int
-	kind: str  # 'head' or 'mlp'
-	index: int
-	def __hash__(self) -> int:
-		return hash((self.layer, self.kind, self.index))
-	def __repr__(self) -> str:  # pragma: no cover - repr trivial
-		return f"{self.kind}[layer={self.layer}, index={self.index}]"
+    layer: int
+    kind: str  # 'head' or 'mlp'
+    index: int
+
+    def __hash__(self) -> int:
+        return hash((self.layer, self.kind, self.index))
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"{self.kind}[layer={self.layer}, index={self.index}]"
+
 
 class CircuitExtractor:
-	def __init__(self, model: Any, top_k: Optional[int] = 5) -> None:
-		self.model = model
-		self.top_k = top_k
-		self.model.cfg.use_split_qkv_input = True
-		self.model.cfg.use_attn_result = True
-		self.model.cfg.use_hook_mlp_in = True
+    def __init__(self, model: HookedTransformer, top_k: Optional[int] = 5) -> None:
+        self.model = model
+        self.top_k = top_k
+        self.graph = Graph.from_model(model)
+        # Enable hooks needed for EAP
+        self.model.cfg.use_split_qkv_input = True
+        self.model.cfg.use_attn_result = True
+        self.model.cfg.use_hook_mlp_in = True
 
-	def _register_hooks(self):
-		activations_head = {}
-		activations_mlp = {}
-		gradients_head = {}
-		gradients_mlp = {}
-		n_layers = self.model.cfg.n_layers
-  
-		def f_head(layer: int):
-			def hook(act, hook=None):
-				activations_head[layer] = act.detach(); act.requires_grad_(True); return act
-			return hook
+    def _get_metric_fn(self, positions: torch.Tensor, target_ids: torch.Tensor):
+        def metric(logits: torch.Tensor, corrupted_logits: torch.Tensor, input_lengths: torch.Tensor, label: Any) -> torch.Tensor:
+            # Sum log-probabilities of all target tokens at their respective positions (teacher forcing)
+            # logits: [batch, pos, vocab]
+            # positions: [m], target_ids: [m]
+            logprobs = logits.log_softmax(dim=-1)
+            # Batch size is 1 in our EAP dataloader; index accordingly
+            selected = logprobs[0, positions, :].gather(dim=1, index=target_ids.view(-1, 1))
+            return selected.sum()
+        return metric
 
-		def f_mlp(layer: int):
-			def hook(act, hook=None):
-				activations_mlp[layer] = act.detach(); act.requires_grad_(True); return act
-			return hook
+    def _scores_to_components(self, scores: torch.Tensor) -> Dict[Component, float]:
+        from .eap import InputNode, MLPNode, AttentionNode
+        component_scores: Dict[Component, float] = {}
+        # scores has shape (n_forward, n_backward). Sum over backward dim to get score per source component.
+        per_component_scores = scores.abs().sum(dim=1)
 
-		def b_head(layer: int):
-			def hook(grad, hook=None):
-				gradients_head[layer] = grad.detach(); return grad
-			return hook
+        for fwd_idx, score in enumerate(per_component_scores.tolist()):
+            node = self.graph.idx_to_forward_node.get(fwd_idx)
+            if node is None or isinstance(node, InputNode):
+                continue
 
-		def b_mlp(layer: int):
-			def hook(grad, hook=None):
-				gradients_mlp[layer] = grad.detach(); return grad
-			return hook
+            comp = None
+            if isinstance(node, MLPNode):
+                comp = Component(layer=node.layer, kind="mlp", index=0)
+            elif isinstance(node, AttentionNode):
+                comp = Component(layer=node.layer, kind="head", index=node.head)
 
-		f_hooks: List[Tuple[str, callable]] = []
-		b_hooks: List[Tuple[str, callable]] = []
-		for layer in range(n_layers):
-			f_hooks.append((f"blocks.{layer}.attn.hook_result", f_head(layer)))
-			b_hooks.append((f"blocks.{layer}.attn.hook_result", b_head(layer)))
-			f_hooks.append((f"blocks.{layer}.hook_mlp_out", f_mlp(layer)))
-			b_hooks.append((f"blocks.{layer}.hook_mlp_out", b_mlp(layer)))
+            if comp:
+                component_scores[comp] = score
+        return component_scores
 
-		return f_hooks, b_hooks, activations_head, activations_mlp, gradients_head, gradients_mlp
+    def extract_circuit(self, example: Example) -> Set[Component]:
+        # Tokenize prompt and full prompt+target for principled multi-token metric
+        prompt_tok = self.model.to_tokens(example.prompt, prepend_bos=True)
+        clean_full_tok = self.model.to_tokens(example.prompt + example.target, prepend_bos=True)
+        corrupted_full_tok = self.model.to_tokens(example.corrupted_prompt + example.corrupted_target, prepend_bos=True)
 
-	def _compute_scores(self, act_h, act_m, grad_h, grad_m) -> Dict[Component, float]:
-		scores: Dict[Component, float] = {}
-		for layer, act in act_h.items():
-			grad = grad_h.get(layer)
-			if grad is None: continue   
-			b, p, n_head, h = act.shape
-			prod = (act * grad).abs().sum(dim=(0,1,3))  # [n_head]
-			for head in range(n_head):
-				scores[Component(layer, 'head', head)] = float(prod[head].item())
-	
-		for layer, act in act_m.items():
-			grad = grad_m.get(layer)
-			if grad is None: continue
-			scores[Component(layer, 'mlp', 0)] = float((act * grad).abs().sum().item())
+        # Derive target token IDs after the prompt boundary
+        device = self.model.cfg.device
+        # Local derivation to avoid circular import: get tokens in full vs prompt and take the suffix
+        p_ids = prompt_tok.to(device)[0].tolist()
+        f_ids = clean_full_tok.to(device)[0].tolist()
+        lcp = 0
+        for a, b in zip(p_ids, f_ids):
+            if a == b:
+                lcp += 1
+            else:
+                break
+        gold_ids_list = f_ids[lcp:] if lcp < len(f_ids) else self.model.to_tokens(example.target, prepend_bos=False).to(device)[0].tolist()
+        target_ids = torch.tensor(gold_ids_list, device=device, dtype=torch.long)
+        prompt_len = prompt_tok.shape[1]
+        positions = torch.arange(prompt_len - 1, prompt_len - 1 + len(gold_ids_list), device=device, dtype=torch.long)
 
-		return scores
+        # Pad clean/corrupted sequences to the same length
+        max_len = max(clean_full_tok.shape[1], corrupted_full_tok.shape[1])
+        pad_token = self.model.tokenizer.pad_token_id if self.model.tokenizer.pad_token_id is not None else self.model.tokenizer.eos_token_id
 
-	def extract_circuit(self, prompt: str, target: str) -> Set[Component]:
-		device = self.model.cfg.device
-		prompt_tokens = self.model.to_tokens(prompt, prepend_bos=True).to(device)
-		target_id = self.model.to_tokens(target, prepend_bos=False)[0, 0].item()
-		f_hooks, b_hooks, act_h, act_m, grad_h, grad_m = self._register_hooks()
-		self.model.zero_grad()
-		with self.model.hooks(f_hooks + b_hooks):
-			logits = self.model(prompt_tokens)
-			last_pos = logits.size(1) - 1
-			loss = -logits[0, last_pos, target_id]
-			loss.backward()
-		scores = self._compute_scores(act_h, act_m, grad_h, grad_m)
-		items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        clean_padding = (max_len - clean_full_tok.shape[1], 0)
+        clean_tokens = F.pad(clean_full_tok, clean_padding, "constant", pad_token)
+        clean_attention_mask = (clean_tokens != pad_token).long()
+        # Not used by metric anymore, but keep shape for API compatibility
+        clean_input_lengths = torch.tensor([clean_full_tok.shape[1]], device=clean_tokens.device)
 
-		if self.top_k is not None:
-			items = items[:self.top_k]
-		return {c for c,_ in items}
+        corrupted_padding = (max_len - corrupted_full_tok.shape[1], 0)
+        corrupted_tokens = F.pad(corrupted_full_tok, corrupted_padding, "constant", pad_token)
+        corrupted_attention_mask = (corrupted_tokens != pad_token).long()
+
+        # Build metric for multi-token targets
+        metric = self._get_metric_fn(positions=positions, target_ids=target_ids)
+
+        dataloader = [
+            (
+                (clean_tokens.to(device), clean_attention_mask.to(device), clean_input_lengths.to(device), max_len),
+                (corrupted_tokens.to(device), corrupted_attention_mask.to(device), None, None),
+                (positions, target_ids),
+            )
+        ]
+
+        scores = attribute(
+            model=self.model,
+            graph=self.graph,
+            dataloader=dataloader,
+            metric=metric,
+            method="EAP",
+            quiet=True,
+        )
+
+        component_scores = self._scores_to_components(scores)
+        items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
+
+        if self.top_k is not None:
+            items = items[: self.top_k]
+        return {c for c, _ in items}
 
 
 def compute_shared_circuit(circuits: List[Set[Component]]) -> Set[Component]:
-	if not circuits: 
-		return set()
-	shared = set(circuits[0])
-	for c in circuits[1:]:
-		shared.intersection_update(c)
-	return shared
+    if not circuits:
+        return set()
+    shared = set(circuits[0])
+    for c in circuits[1:]:
+        shared.intersection_update(c)
+    return shared
+
 
 __all__ = ["Component", "CircuitExtractor", "compute_shared_circuit"]
