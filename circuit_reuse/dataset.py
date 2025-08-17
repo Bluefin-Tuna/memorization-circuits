@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from typing import List, Tuple, Iterable
-from datasets import load_dataset  # assume installed
+from datasets import load_dataset
 
 @dataclass
 class ArithmeticExample:

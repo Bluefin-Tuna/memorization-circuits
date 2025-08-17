@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# Minimal CLI to run circuit reuse experiments.
-
 import argparse
 import time
 from typing import List
@@ -203,7 +200,7 @@ def _run_single_combination(
         "num_examples": len(dataset),
         "digits": digits if task == "addition" else None,
         "top_k": top_k,
-    "method": "gradient",
+        "method": "gradient",
 
         "baseline_train_accuracy": baseline_train_acc,
         "baseline_train_correct": baseline_train_correct,
