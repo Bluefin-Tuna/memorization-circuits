@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,20 @@ from circuit_reuse.dataset import (
 METHOD_DISPLAY = {
     "eap": "EAP",
 }
+
+
+def safe_filename(name: str) -> str:
+    """Return a filesystem-safe filename chunk.
+
+    Replaces any character that's not alphanumeric, dash, underscore, or dot
+    with an underscore, collapses repeated underscores, and strips edges.
+    """
+    # Replace path separators and any other unsafe chars
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))
+    # Collapse multiple underscores
+    s = re.sub(r"_+", "_", s)
+    # Trim leading/trailing underscores or dots
+    return s.strip("_.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +74,17 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         choices=["drop", "baseline", "ablation", "task"],
         help="Ordering of tasks within each plot.",
+    )
+    p.add_argument(
+        "--task-order",
+        type=str,
+        default="alpha",
+        choices=["alpha", "sort_by"],
+        help=(
+            "Task order strategy across models: 'alpha' enforces a global alphabetical "
+            "order by task name for all plots (consistent across models). 'sort_by' uses "
+            "the --sort-by logic per model (may differ across models)."
+        ),
     )
     p.add_argument(
         "--percent",
@@ -131,6 +157,7 @@ def plot_all(
     overlay_scores: bool,
     include_control: bool,
     ci_level: float,
+    task_order: str,
 ):
     if df.empty:
         print("[INFO] No data to plot.")
@@ -168,6 +195,10 @@ def plot_all(
         )
     )
 
+    # Establish a global alphabetical task order for consistency across models
+    global_task_order = sorted(grouped["task_display"].dropna().unique())
+    task_rank = {t: i for i, t in enumerate(global_task_order)}
+
     for split in ["train", "val"]:
         for cat in ["baseline", "ablation", "control"]:
             correct_col = f"{cat}_{split}_correct"
@@ -199,6 +230,8 @@ def plot_all(
     saved_files: List[str] = []
 
     sns.set_theme(style="ticks", context="talk", palette="colorblind")
+    # Use the same serif font styling as the gradient branch
+    plt.rcParams.update({"font.family": "serif"})
     base_palette = sns.color_palette("colorblind")
 
     def _create_plot(
@@ -213,16 +246,21 @@ def plot_all(
         if sub.empty:
             return
 
-        if sort_by == "drop":
-            sub = sub.assign(
-                _drop=sub[baseline_col] - sub[ablation_col]
-            ).sort_values("_drop", ascending=False)
-        elif sort_by == "baseline":
-            sub = sub.sort_values(baseline_col, ascending=False)
-        elif sort_by == "ablation":
-            sub = sub.sort_values(ablation_col, ascending=False)
+        if task_order == "alpha":
+            # Always apply global alphabetical task order
+            sub = sub.assign(_ord=sub["task_display"].map(task_rank)).sort_values("_ord").drop(columns=["_ord"])
         else:
-            sub = sub.sort_values("task_display")
+            # Use per-model sort_by ordering
+            if sort_by == "drop":
+                sub = sub.assign(
+                    _drop=sub[baseline_col] - sub[ablation_col]
+                ).sort_values("_drop", ascending=False).drop(columns=["_drop"])
+            elif sort_by == "baseline":
+                sub = sub.sort_values(baseline_col, ascending=False)
+            elif sort_by == "ablation":
+                sub = sub.sort_values(ablation_col, ascending=False)
+            else:
+                sub = sub.sort_values("task_display")
 
         tasks = list(sub.task_display)
         scale = 100 if percent else 1
@@ -293,20 +331,27 @@ def plot_all(
                 color=col,
                 yerr=err if error_bars_enabled else None,
                 error_kw=error_kwargs if error_bars_enabled else None,
+                edgecolor="none",
+                linewidth=0,
             )
 
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
+        ax.set_xlabel("Task")
 
         vals_for_max = [v for v in val_arrays if v is not None]
         if percent:
-            ymax = 105
+            # Give extra headroom so labels at ~100% don't touch the top
+            ymax = 110
         else:
-            ymax = (
-                1.05 * float(np.nanmax(vals_for_max))
-                if vals_for_max
+            max_val = (
+                float(np.nanmax(vals_for_max))
+                if vals_for_max and np.isfinite(np.nanmax(vals_for_max))
                 else 1.0
             )
+            ymax = max(1.0, max_val * 1.12)
         ax.set_ylim(0, ymax)
+        # Match grid style from the reference branch
+        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
 
         ax.set_xticks(x)
         ax.set_xticklabels(tasks, rotation=0, ha="center")
@@ -316,10 +361,116 @@ def plot_all(
             loc="upper center",
             bbox_to_anchor=(0.5, -0.20),
             ncol=n_bars,
+            frameon=True,
         )
 
         fig.tight_layout(rect=[0, 0.05, 1, 1])
 
+        # Annotate bar values
+        ymax_current = ax.get_ylim()[1]
+        ypad = 0.015 * ymax_current
+        for off, vals in zip(offsets, val_arrays):
+            if vals is None:
+                continue
+            for xi, v in enumerate(vals):
+                if np.isnan(v):
+                    continue
+                label = f"{v:.1f}" if percent else f"{v:.3f}"
+                ax.text(
+                    x[xi] + off,
+                    min(v + ypad, ymax_current),
+                    label,
+                    ha="center",
+                    va="bottom",
+                    fontsize=12,
+                )
+
+        out_path = out_dir / filename_suffix
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        saved_files.append(out_path.name)
+        if show:
+            plt.show()
+        plt.close()
+
+    def _create_reuse_plot(
+        sub: pd.DataFrame, title_suffix: str, filename_suffix: str
+    ) -> None:
+        if sub.empty:
+            return
+
+        # Compute circuit reuse fraction (shared_circuit_size / top_k)
+        sub = sub.copy()
+        if (
+            "shared_circuit_size_mean" not in sub.columns
+            or "top_k_mean" not in sub.columns
+        ):
+            return
+        with np.errstate(divide="ignore", invalid="ignore"):
+            frac = sub["shared_circuit_size_mean"] / sub["top_k_mean"].replace(
+                0, np.nan
+            )
+        sub["reuse_frac"] = frac.clip(lower=0).fillna(0.0)
+
+        # Apply consistent global task ordering or per-model sorting
+        if task_order == "alpha":
+            sub = (
+                sub.assign(_ord=sub["task_display"].map(task_rank))
+                .sort_values("_ord")
+                .drop(columns=["_ord"])
+            )
+        else:
+            if sort_by in {"drop", "baseline", "ablation"}:
+                sub = sub.sort_values("reuse_frac", ascending=False)
+            else:
+                sub = sub.sort_values("task_display")
+
+        tasks = list(sub.task_display)
+        x = np.arange(len(tasks))
+        vals = sub["reuse_frac"].values * (100.0 if percent else 1.0)
+
+        fig_w = max(8.0, 1.2 * len(tasks) + 2.5)
+        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
+        ax.bar(
+            x,
+            vals,
+            width=0.6,
+            color=sns.color_palette("colorblind")[3],
+            edgecolor="none",
+            linewidth=0,
+        )
+
+        ax.set_ylabel(
+            "Circuit reuse (%)" if percent else "Circuit reuse (fraction)"
+        )
+        ax.set_xlabel("Task")
+        ax.set_xticks(x)
+        ax.set_xticklabels(tasks, rotation=0, ha="center")
+        # Add headroom so labels don't clash with the top of the axes
+        if percent:
+            ax.set_ylim(0, 110)
+        else:
+            max_val = float(np.nanmax(vals)) if len(vals) else 1.0
+            ax.set_ylim(0, max(1.0, max_val * 1.12))
+        ax.set_title(title_suffix)
+        # Match grid style from the reference branch
+        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
+
+        # Annotate values on bars
+        ymax_current = ax.get_ylim()[1]
+        ypad = 0.015 * ymax_current
+        for xi, v in enumerate(vals):
+            if np.isnan(v):
+                continue
+            ax.text(
+                x[xi],
+                min(v + ypad, ymax_current),
+                (f"{v:.1f}" if percent else f"{v:.3f}"),
+                ha="center",
+                va="bottom",
+                fontsize=12,
+            )
+
+        fig.tight_layout(rect=[0, 0.02, 1, 1])
         out_path = out_dir / filename_suffix
         plt.savefig(out_path, dpi=200, bbox_inches="tight")
         saved_files.append(out_path.name)
@@ -330,8 +481,8 @@ def plot_all(
     for (model_disp, method_disp), sub_df in grouped.groupby(
         ["model_display", "method_display"]
     ):
-        safe_model = model_disp.replace(" ", "_")
-        safe_method = method_disp.lower()
+        safe_model = safe_filename(model_disp)
+        safe_method = safe_filename(method_disp.lower())
 
         if (
             "baseline_train_accuracy_mean" in sub_df.columns
@@ -364,6 +515,13 @@ def plot_all(
                     "control_val_accuracy_mean" if include_control else None
                 ),
             )
+
+        # Circuit reuse (%) per task
+        _create_reuse_plot(
+            sub_df,
+            f"{model_disp} - {method_disp}",
+            f"{safe_model}_{safe_method}_reuse.png",
+        )
 
     print(f"[INFO] Plots written to: {out_dir}")
     files_str = ", ".join(saved_files)
@@ -407,7 +565,8 @@ def main():
         percent=percent,
         overlay_scores=args.overlay_scores,
         include_control=not args.no_control,
-        ci_level=args.ci,
+    ci_level=args.ci,
+    task_order=args.task_order,
     )
 
 
