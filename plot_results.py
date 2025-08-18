@@ -195,6 +195,29 @@ def plot_all(
         )
     )
 
+    # Keep top_k for k-sweep line plots
+    grouped_k = (
+        df.groupby(
+            ["model_display", "task_display", "method_display", "top_k"],
+            as_index=False,
+        )
+        .agg(
+            baseline_train_correct=("baseline_train_correct", "sum"),
+            baseline_train_total=("baseline_train_total", "sum"),
+            ablation_train_correct=("ablation_train_correct", "sum"),
+            ablation_train_total=("ablation_train_total", "sum"),
+            control_train_correct=("control_train_correct", "sum"),
+            control_train_total=("control_train_total", "sum"),
+            baseline_val_correct=("baseline_val_correct", "sum"),
+            baseline_val_total=("baseline_val_total", "sum"),
+            ablation_val_correct=("ablation_val_correct", "sum"),
+            ablation_val_total=("ablation_val_total", "sum"),
+            control_val_correct=("control_val_correct", "sum"),
+            control_val_total=("control_val_total", "sum"),
+            shared_circuit_size_mean=("shared_circuit_size", "mean"),
+        )
+    )
+
     # Establish a global alphabetical task order for consistency across models
     global_task_order = sorted(grouped["task_display"].dropna().unique())
     task_rank = {t: i for i, t in enumerate(global_task_order)}
@@ -226,6 +249,34 @@ def plot_all(
                     grouped[err_col] = grouped.apply(_sym_err, axis=1)
                 else:
                     grouped[err_col] = 0.0
+
+    # Compute accuracies and CI for k-sweep table as well
+    if not grouped_k.empty:
+        for split in ["train", "val"]:
+            for cat in ["baseline", "ablation", "control"]:
+                correct_col = f"{cat}_{split}_correct"
+                total_col = f"{cat}_{split}_total"
+                acc_col = f"{cat}_{split}_accuracy_mean"
+                err_col = f"{cat}_{split}_accuracy_error"
+
+                if correct_col in grouped_k.columns and total_col in grouped_k.columns:
+                    grouped_k[acc_col] = (
+                        grouped_k[correct_col]
+                        / grouped_k[total_col].replace(0, np.nan)
+                    )
+
+                    if error_bars_enabled:
+
+                        def _sym_err_k(row: pd.Series) -> float:
+                            p = row[acc_col]
+                            n = row[total_col]
+                            if pd.isna(p) or n <= 0:
+                                return 0.0
+                            return float(z_score * np.sqrt(p * (1 - p) / n))
+
+                        grouped_k[err_col] = grouped_k.apply(_sym_err_k, axis=1)
+                    else:
+                        grouped_k[err_col] = 0.0
 
     saved_files: List[str] = []
 
@@ -386,6 +437,7 @@ def plot_all(
                 )
 
         out_path = out_dir / filename_suffix
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=200, bbox_inches="tight")
         saved_files.append(out_path.name)
         if show:
@@ -472,12 +524,14 @@ def plot_all(
 
         fig.tight_layout(rect=[0, 0.02, 1, 1])
         out_path = out_dir / filename_suffix
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=200, bbox_inches="tight")
         saved_files.append(out_path.name)
         if show:
             plt.show()
         plt.close()
 
+    # Legacy per-model plots (bars by task), annotated as aggregated across k
     for (model_disp, method_disp), sub_df in grouped.groupby(
         ["model_display", "method_display"]
     ):
@@ -492,8 +546,8 @@ def plot_all(
                 sub_df,
                 "baseline_train_accuracy_mean",
                 "ablation_train_accuracy_mean",
-                f"{model_disp} - {method_disp} (Train)",
-                f"{safe_model}_{safe_method}_train.png",
+                f"{model_disp} - {method_disp} (Train) [aggregated across k]",
+                f"{safe_model}/all_k/{safe_model}_{safe_method}_train_all_k.png",
                 control_col=(
                     "control_train_accuracy_mean" if include_control else None
                 ),
@@ -509,8 +563,8 @@ def plot_all(
                 sub_df,
                 "baseline_val_accuracy_mean",
                 "ablation_val_accuracy_mean",
-                f"{model_disp} - {method_disp} (Validation)",
-                f"{safe_model}_{safe_method}_val.png",
+                f"{model_disp} - {method_disp} (Validation) [aggregated across k]",
+                f"{safe_model}/all_k/{safe_model}_{safe_method}_val_all_k.png",
                 control_col=(
                     "control_val_accuracy_mean" if include_control else None
                 ),
@@ -519,9 +573,181 @@ def plot_all(
         # Circuit reuse (%) per task
         _create_reuse_plot(
             sub_df,
-            f"{model_disp} - {method_disp}",
-            f"{safe_model}_{safe_method}_reuse.png",
+            f"{model_disp} - {method_disp} [aggregated across k]",
+            f"{safe_model}/all_k/{safe_model}_{safe_method}_reuse_all_k.png",
         )
+
+    def _create_drop_vs_k_plot(
+        sub_k: pd.DataFrame,
+        split: str,
+        title_prefix: str,
+        filename_prefix: str,
+    ) -> None:
+        if sub_k.empty:
+            return
+        sub_k = sub_k.sort_values("top_k")
+        ks = sub_k["top_k"].values
+        base = sub_k.get(f"baseline_{split}_accuracy_mean", pd.Series(dtype=float)).values
+        abl = sub_k.get(f"ablation_{split}_accuracy_mean", pd.Series(dtype=float)).values
+        scale = 100 if percent else 1
+        drop = (base - abl) * scale
+
+        fig, ax = plt.subplots(figsize=(7.5, 5.0))
+        ax.plot(ks, drop, marker="o", linewidth=2.0, color=base_palette[4], label="Drop (Baseline - Ablated)")
+        ax.set_xlabel("top_k")
+        ax.set_ylabel("Accuracy drop (pp)" if percent else "Accuracy drop")
+        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
+        ax.set_title(f"{title_prefix} - Accuracy Drop vs top_k (k-sweep, {split.title()})")
+        ax.legend(loc="best")
+        fig.tight_layout()
+
+        out_path = out_dir / f"{filename_prefix}_drop_vs_k_{split}.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        saved_files.append(out_path.name)
+        if show:
+            plt.show()
+        plt.close()
+
+    def _create_reuse_plot_for_k(
+        sub_k: pd.DataFrame,
+        model_disp: str,
+        method_disp: str,
+        k_val: int,
+        safe_model: str,
+        safe_method: str,
+    ) -> None:
+        if sub_k.empty:
+            return
+        sub = sub_k.copy()
+        # Ensure tasks ordered as requested
+        if task_order == "alpha":
+            sub = (
+                sub.assign(_ord=sub["task_display"].map(task_rank))
+                .sort_values("_ord")
+                .drop(columns=["_ord"])
+            )
+        else:
+            # Default to alphabetical within k
+            sub = sub.sort_values("task_display")
+
+        # Compute reuse fraction = shared_circuit_size_mean / k
+        with np.errstate(divide="ignore", invalid="ignore"):
+            reuse_frac = sub["shared_circuit_size_mean"] / float(k_val)
+        sub["reuse_frac"] = reuse_frac.clip(lower=0).fillna(0.0)
+
+        tasks = list(sub.task_display)
+        x = np.arange(len(tasks))
+        vals = sub["reuse_frac"].values * (100.0 if percent else 1.0)
+
+        fig_w = max(8.0, 1.2 * len(tasks) + 2.5)
+        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
+        ax.bar(
+            x,
+            vals,
+            width=0.6,
+            color=sns.color_palette("colorblind")[3],
+            edgecolor="none",
+            linewidth=0,
+        )
+        ax.set_ylabel(
+            "Circuit reuse (%)" if percent else "Circuit reuse (fraction)"
+        )
+        ax.set_xlabel("Task")
+        ax.set_xticks(x)
+        ax.set_xticklabels(tasks, rotation=0, ha="center")
+        if percent:
+            ax.set_ylim(0, 110)
+        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
+        ax.set_title(f"{model_disp} - {method_disp} (k={k_val})")
+
+        # Annotate values
+        ymax_current = ax.get_ylim()[1]
+        ypad = 0.015 * ymax_current
+        for xi, v in enumerate(vals):
+            if np.isnan(v):
+                continue
+            ax.text(
+                x[xi],
+                min(v + ypad, ymax_current),
+                (f"{v:.1f}" if percent else f"{v:.3f}"),
+                ha="center",
+                va="bottom",
+                fontsize=12,
+            )
+
+        out_path = out_dir / f"{safe_model}/{k_val}/{safe_model}_{safe_method}_k{k_val}_reuse.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        saved_files.append(str(out_path.relative_to(out_dir)))
+        if show:
+            plt.show()
+        plt.close()
+
+    if not grouped_k.empty:
+        # Per-model, per-task: only drop vs k plots (sweep)
+        for (model_disp, task_disp, method_disp), sub_k_df in grouped_k.groupby(
+            ["model_display", "task_display", "method_display"], as_index=False
+        ):
+            safe_model = safe_filename(model_disp)
+            safe_task = safe_filename(task_disp)
+            safe_method = safe_filename(method_disp.lower())
+            title_prefix = f"{model_disp} - {method_disp} - {task_disp}"
+            filename_prefix = f"{safe_model}/{safe_task}/{safe_model}_{safe_method}_{safe_task}"
+
+            has_val = (
+                "baseline_val_total" in sub_k_df.columns
+                and sub_k_df["baseline_val_total"].sum() > 0
+            )
+            if has_val:
+                _create_drop_vs_k_plot(sub_k_df.copy(), "val", title_prefix, filename_prefix)
+            _create_drop_vs_k_plot(sub_k_df.copy(), "train", title_prefix, filename_prefix)
+
+        # Per-model, per-k: three bar plots across tasks (train, val, reuse)
+        for (model_disp, method_disp, k_val), sub_k_df in grouped_k.groupby(
+            ["model_display", "method_display", "top_k"], as_index=False
+        ):
+            safe_model = safe_filename(model_disp)
+            safe_method = safe_filename(method_disp.lower())
+
+            # Train bar plot (by task) with explicit k
+            _create_plot(
+                sub_k_df,
+                "baseline_train_accuracy_mean",
+                "ablation_train_accuracy_mean",
+                f"{model_disp} - {method_disp} (Train, k={int(k_val)})",
+                f"{safe_model}/{int(k_val)}/{safe_model}_{safe_method}_k{int(k_val)}_train.png",
+                control_col=(
+                    "control_train_accuracy_mean" if include_control else None
+                ),
+            )
+
+            # Val bar plot (by task) with explicit k (only if val exists)
+            has_val = (
+                "baseline_val_total" in sub_k_df.columns
+                and sub_k_df["baseline_val_total"].sum() > 0
+            )
+            if has_val:
+                _create_plot(
+                    sub_k_df,
+                    "baseline_val_accuracy_mean",
+                    "ablation_val_accuracy_mean",
+                    f"{model_disp} - {method_disp} (Validation, k={int(k_val)})",
+                    f"{safe_model}/{int(k_val)}/{safe_model}_{safe_method}_k{int(k_val)}_val.png",
+                    control_col=(
+                        "control_val_accuracy_mean" if include_control else None
+                    ),
+                )
+
+            # Reuse per task at this k
+            _create_reuse_plot_for_k(
+                sub_k_df,
+                model_disp,
+                method_disp,
+                int(k_val),
+                safe_model,
+                safe_method,
+            )
 
     print(f"[INFO] Plots written to: {out_dir}")
     files_str = ", ".join(saved_files)
@@ -556,6 +782,46 @@ def main():
     csv_path = out_dir / args.save_csv_name
     df.to_csv(csv_path, index=False)
     print(f"[INFO] Aggregated CSV saved to {csv_path}")
+
+    # Also emit an aggregated-by-topk CSV for convenience
+    if "top_k" in df.columns:
+        by_k = (
+            df.groupby([
+                "model_name",
+                "model_display",
+                "task",
+                "task_display",
+                "method",
+                "method_display",
+                "top_k",
+            ], as_index=False)
+            .agg(
+                baseline_train_correct=("baseline_train_correct", "sum"),
+                baseline_train_total=("baseline_train_total", "sum"),
+                ablation_train_correct=("ablation_train_correct", "sum"),
+                ablation_train_total=("ablation_train_total", "sum"),
+                control_train_correct=("control_train_correct", "sum"),
+                control_train_total=("control_train_total", "sum"),
+                baseline_val_correct=("baseline_val_correct", "sum"),
+                baseline_val_total=("baseline_val_total", "sum"),
+                ablation_val_correct=("ablation_val_correct", "sum"),
+                ablation_val_total=("ablation_val_total", "sum"),
+                control_val_correct=("control_val_correct", "sum"),
+                control_val_total=("control_val_total", "sum"),
+                shared_circuit_size_mean=("shared_circuit_size", "mean"),
+            )
+        )
+        # Compute accuracies
+        for split in ["train", "val"]:
+            for cat in ["baseline", "ablation", "control"]:
+                c = f"{cat}_{split}_correct"
+                t = f"{cat}_{split}_total"
+                a = f"{cat}_{split}_accuracy"
+                if c in by_k.columns and t in by_k.columns:
+                    by_k[a] = by_k[c] / by_k[t].replace(0, np.nan)
+        by_k_csv = out_dir / "aggregated_by_topk.csv"
+        by_k.sort_values(["model_display", "task_display", "method_display", "top_k"]).to_csv(by_k_csv, index=False)
+        print(f"[INFO] Aggregated-by-topk CSV saved to {by_k_csv}")
 
     plot_all(
         df,
