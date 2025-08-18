@@ -181,34 +181,90 @@ class MMLUDataset:
         return iter(self._examples)
 
 
-class MIBDataset:
-    def __init__(self, name: str = "ioi", split: str = "test", num_examples: int | None = None) -> None:
+class IOIDataset:
+    """Loads the Indirect Object Identification (IOI) dataset from MIB-bench."""
+
+    def __init__(self, split: str = "test", num_examples: int | None = None) -> None:
+        ds = load_dataset("mib-bench/ioi", split=split)
+        self._examples: List[Example] = []
+        count = 0
+        for item in ds:
+            # Clean example
+            prompt = item["prompt"]
+            target = item["choices"][item["answerKey"]]
+
+            # Corrupted example using the 'random_names_counterfactual'
+            corrupted_item = item["random_names_counterfactual"]
+            corrupted_prompt = corrupted_item["prompt"]
+            corrupted_target = corrupted_item["choices"][corrupted_item["answerKey"]]
+
+            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target))
+            count += 1
+            if num_examples is not None and count >= num_examples:
+                break
+
+    def __len__(self) -> int:
+        return len(self._examples)
+
+    def __getitem__(self, idx: int) -> Example:
+        return self._examples[idx]
+
+    def __iter__(self) -> Iterable[Example]:
+        return iter(self._examples)
+
+
+class MCQADataset:
+    """Loads the CopyColors MCQA dataset from MIB-bench."""
+
+    def __init__(self, split: str = "test", num_examples: int | None = None) -> None:
+        ds = load_dataset("mib-bench/copycolors_mcqa", split=split)
+        self._examples: List[Example] = []
+        count = 0
+        for item in ds:
+            # Clean example
+            prompt = item["prompt"]
+            target = item["choices"]["label"][item["answerKey"]]
+
+            # Corrupted example using 'answerPosition_counterfactual'
+            corrupted_item = item["answerPosition_counterfactual"]
+            corrupted_prompt = corrupted_item["prompt"]
+            corrupted_target = corrupted_item["choices"]["label"][corrupted_item["answerKey"]]
+
+            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target))
+            count += 1
+            if num_examples is not None and count >= num_examples:
+                break
+
+    def __len__(self) -> int:
+        return len(self._examples)
+
+    def __getitem__(self, idx: int) -> Example:
+        return self._examples[idx]
+
+    def __iter__(self) -> Iterable[Example]:
+        return iter(self._examples)
+
+
+class ARCDataset:
+    """Loads ARC (Easy or Challenge) datasets from MIB-bench."""
+
+    def __init__(self, name: str, split: str = "test", num_examples: int | None = None) -> None:
+        assert name in ("arc_easy", "arc_challenge")
         ds = load_dataset(f"mib-bench/{name}", split=split)
         self._examples: List[Example] = []
         count = 0
         for item in ds:
-            prompt_text = item.get("prompt") or item.get("template") or item.get("question")
-            choices = item.get("choices", [])
-            answer_key = item.get("answerKey", -1)
-            if prompt_text is None or not choices or answer_key is None or answer_key < 0 or answer_key >= len(choices):
-                continue
-
             # Clean example
-            parts = [f"({chr(ord('A') + idx)}) {c}" for idx, c in enumerate(choices)]
-            prompt = f"{prompt_text} " + " ".join(parts)
-            target = chr(ord("A") + answer_key)
+            prompt = item["prompt"]
+            # The 'label' field contains the actual choice characters (e.g., 'A', 'B', 'C', 'D')
+            target = item["choices"]["label"][item["answerKey"]]
 
-            # Corrupted example (shuffled choices)
-            shuffled_choices = choices[:]
-            random.shuffle(shuffled_choices)
-            correct_answer_text = choices[answer_key]
-            new_ans_idx = shuffled_choices.index(correct_answer_text)
+            # Corrupted example using 'answerPosition_counterfactual'
+            corrupted_item = item["answerPosition_counterfactual"]
+            corrupted_prompt = corrupted_item["prompt"]
+            corrupted_target = corrupted_item["choices"]["label"][corrupted_item["answerKey"]]
 
-            corrupted_parts = [f"({chr(ord('A') + idx)}) {c}" for idx, c in enumerate(shuffled_choices)]
-            corrupted_prompt = f"{prompt_text} " + " ".join(corrupted_parts)
-            corrupted_target = chr(ord("A") + new_ans_idx)
-
-            self._examples.append(Example(prompt.strip(), target, corrupted_prompt.strip(), corrupted_target))
+            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target))
             count += 1
             if num_examples is not None and count >= num_examples:
                 break
@@ -227,6 +283,10 @@ DATASET_DISPLAY_NAMES: dict[str, str] = {
     "addition": "Addition",
     "boolean": "Boolean",
     "mmlu": "MMLU",
+    "ioi": "MIB: IOI",
+    "mcqa": "MIB: MCQA",
+    "arc_easy": "MIB: ARC (Easy)",
+    "arc_challenge": "MIB: ARC (Challenge)",
 }
 
 MODEL_DISPLAY_NAMES: dict[str, str] = {
@@ -238,9 +298,6 @@ MODEL_DISPLAY_NAMES: dict[str, str] = {
 def get_task_display_name(task: str) -> str:
     if task in DATASET_DISPLAY_NAMES:
         return DATASET_DISPLAY_NAMES[task]
-    if task.startswith("mib_"):
-        suffix = task[len("mib_") :].replace("_", " ").title()
-        return f"MIB: {suffix}"
     return task.replace("_", " ").title()
 
 
@@ -267,8 +324,12 @@ def get_dataset(task: str, num_examples: int = 100, digits: int = 2) -> Iterable
         return BooleanDataset(num_examples=num_examples)
     if task == "mmlu":
         return MMLUDataset(split="test", num_examples=num_examples)
-    if task.startswith("mib_"):
-        return MIBDataset(name=task[len("mib_") :], split="test", num_examples=num_examples)
+    if task == "ioi":
+        return IOIDataset(split="test", num_examples=num_examples)
+    if task == "mcqa":
+        return MCQADataset(split="test", num_examples=num_examples)
+    if task in ("arc_easy", "arc_challenge"):
+        return ARCDataset(name=task, split="test", num_examples=num_examples)
     raise ValueError(f"Unsupported task: {task}")
 
 
@@ -277,7 +338,9 @@ __all__ = [
     "AdditionDataset",
     "BooleanDataset",
     "MMLUDataset",
-    "MIBDataset",
+    "IOIDataset",
+    "MCQADataset",
+    "ARCDataset",
     "get_dataset",
     "get_task_display_name",
     "get_model_display_name",

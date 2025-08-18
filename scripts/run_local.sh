@@ -1,12 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# Define search space
 models=("qwen3-0.6b")
-tasks=("addition")
-top_ks=(50)
-digits_list=(3)
-num_examples_list=(100)
+tasks=("addition" "ioi" "mcqa" "arc_easy" "arc_challenge") 
+top_ks=(5)
+digits_list=(2)
+num_examples_list=(10) 
 
 # Enumerate combinations
 for model in "${models[@]}"; do
@@ -14,6 +13,9 @@ for model in "${models[@]}"; do
     for topk in "${top_ks[@]}"; do
       for digits in "${digits_list[@]}"; do
         for numex in "${num_examples_list[@]}"; do
+          echo "---"
+          echo "[RUNNING] Model: $model, Task: $task, TopK: $topk, Examples: $numex"
+          
           python run_experiment.py \
             --model_names "$model" \
             --tasks "$task" \
@@ -22,12 +24,14 @@ for model in "${models[@]}"; do
             --num_examples_list "$numex" \
             --dtype bf16 \
             --device cpu \
-            --run-name "local" \
-            --output-dir results
+            --run-name "local_test" \
+            --output-dir results \
+            --debug
         done
       done
     done
   done
 done
 
-echo "[DONE] Completed all experiments"
+echo ""
+echo "[DONE] ✅ Completed all local test experiments."

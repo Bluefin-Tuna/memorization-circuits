@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Iterable, List, Tuple, Any
 import torch
-import torch
 from .dataset import Example
 from .circuit_extraction import Component
+
 
 def _extract_gold_ids(model: Any, prompt: str, target: str, device, verbose: bool = False) -> List[int]:
     prompt_tok = model.to_tokens(prompt, prepend_bos=True).to(device)
@@ -28,8 +28,10 @@ def _extract_gold_ids(model: Any, prompt: str, target: str, device, verbose: boo
         print(f"[WARN] Derived empty gold ids unexpectedly; prompt_len={len(p_ids)} full_len={len(f_ids)}")
     return [int(x) for x in gold_ids]
 
+
 _BOOL_CACHE = {}
 _MC_CACHE = {}
+
 
 def _boolean_token_id_groups(model) -> Tuple[set, set]:
     cache_key = id(model)
@@ -37,6 +39,7 @@ def _boolean_token_id_groups(model) -> Tuple[set, set]:
         return _BOOL_CACHE[cache_key]
     variants_true = [" true", "true", " True", "True"]
     variants_false = [" false", "false", " False", "False"]
+
     def collect(variants):
         out = set()
         for v in variants:
@@ -45,9 +48,11 @@ def _boolean_token_id_groups(model) -> Tuple[set, set]:
             if len(ids) == 1:
                 out.add(int(ids[0]))
         return out
+
     res = (collect(variants_true), collect(variants_false))
     _BOOL_CACHE[cache_key] = res
     return res
+
 
 def _classify_boolean(logits_last: Any, model, verbose: bool = False) -> Tuple[str, dict]:
     true_ids, false_ids = _boolean_token_id_groups(model)
@@ -60,33 +65,40 @@ def _classify_boolean(logits_last: Any, model, verbose: bool = False) -> Tuple[s
         print(f"[BOOL-CLASSIFY] true_score={true_score:.3f} false_score={false_score:.3f} label={label}")
     return label, id_logits
 
+
 def _mc_letter_token_id_groups(model) -> dict:
     cache_key = id(model)
     if cache_key in _MC_CACHE:
         return _MC_CACHE[cache_key]
     out = {}
-    for L in "ABCD":
+    # Use all uppercase letters to handle various MCQA formats (e.g., up to 10 choices, random letters)
+    for i in range(26):
+        L = chr(ord("A") + i)
         ids = set()
         for variant in (L, f" {L}", f"\n{L}"):
             toks = model.to_tokens(variant, prepend_bos=False)
             t_ids = toks[0].tolist()
             if len(t_ids) == 1:
                 ids.add(int(t_ids[0]))
-        out[L] = ids
+        if ids:  # Only add letters that tokenize to a single token
+            out[L] = ids
     _MC_CACHE[cache_key] = out
     return out
+
 
 def _classify_multiple_choice(logits_last: Any, model, verbose: bool = False) -> str:
     groups = _mc_letter_token_id_groups(model)
     best_letter, best_score = "A", float("-inf")
     for L, id_set in groups.items():
-        if not id_set: continue
+        if not id_set:
+            continue
         score = max(float(logits_last[tid].item()) for tid in id_set)
         if score > best_score:
             best_score, best_letter = score, L
     if verbose:
         print(f"[MC-CLASSIFY] scores=" + ", ".join(f"{L}:{'none' if not ids else max(logits_last[i].item() for i in ids):.3f}" for L, ids in groups.items()))
     return best_letter
+
 
 def evaluate_accuracy(model: Any, dataset: Iterable[Example], task: str, verbose: bool = False) -> Tuple[int, int]:
     model.eval()
@@ -99,10 +111,12 @@ def evaluate_accuracy(model: Any, dataset: Iterable[Example], task: str, verbose
             logits_last = logits[0, -1]
             if task == "boolean":
                 pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
-                if pred_label == target: correct += 1
-            elif task.startswith("mmlu") or task.startswith("mib_"):
+                if pred_label == target:
+                    correct += 1
+            elif task in ("mmlu", "mcqa", "arc_easy", "arc_challenge"):
                 pred_label = _classify_multiple_choice(logits_last, model, verbose=verbose)
-                if pred_label == target: correct += 1
+                if pred_label == target:
+                    correct += 1
             else:
                 gold_ids = _extract_gold_ids(model, prompt, target, device=device, verbose=verbose)
                 if gold_ids and int(logits_last.argmax().item()) in gold_ids:
@@ -110,19 +124,26 @@ def evaluate_accuracy(model: Any, dataset: Iterable[Example], task: str, verbose
             total += 1
     return correct, total
 
-def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[Example], task: str, removed: Iterable[Component], verbose: bool = False) -> Tuple[int, int]:
+
+def evaluate_accuracy_with_ablation(
+    model: Any, dataset: Iterable[Example], task: str, removed: Iterable[Component], verbose: bool = False
+) -> Tuple[int, int]:
     model.eval()
     hooks: List[Tuple[str, callable]] = []
     for comp in removed:
         if comp.kind == "head":
+
             def hook_head(act, hook=None, head_index=comp.index):
                 act[:, :, head_index, :] = 0.0
                 return act
+
             hooks.append((f"blocks.{comp.layer}.attn.hook_result", hook_head))
         elif comp.kind == "mlp":
+
             def hook_mlp(act, hook=None):
                 act[:, :, :] = 0.0
                 return act
+
             hooks.append((f"blocks.{comp.layer}.hook_mlp_out", hook_mlp))
 
     correct, total = 0, 0
@@ -134,15 +155,18 @@ def evaluate_accuracy_with_ablation(model: Any, dataset: Iterable[Example], task
             logits_last = logits[0, -1]
             if task == "boolean":
                 pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
-                if pred_label == target: correct += 1
-            elif task.startswith("mmlu") or task.startswith("mib_"):
+                if pred_label == target:
+                    correct += 1
+            elif task in ("mmlu", "mcqa", "arc_easy", "arc_challenge"):
                 pred_label = _classify_multiple_choice(logits_last, model, verbose=verbose)
-                if pred_label == target: correct += 1
+                if pred_label == target:
+                    correct += 1
             else:
                 gold_ids = _extract_gold_ids(model, prompt, target, device=device, verbose=verbose)
                 if gold_ids and int(logits_last.argmax().item()) in gold_ids:
                     correct += 1
             total += 1
     return correct, total
+
 
 __all__ = ["evaluate_accuracy", "evaluate_accuracy_with_ablation"]
