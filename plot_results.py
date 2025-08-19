@@ -20,6 +20,7 @@ from circuit_reuse.dataset import (
 
 METHOD_DISPLAY = {
     "eap": "EAP",
+    "gradient": "Gradient",
 }
 
 
@@ -575,7 +576,11 @@ def plot_all(
         fig, ax = plt.subplots(figsize=(fig_w, 6.0))
 
         scale = 100 if percent else 1
-        colors = sns.color_palette("colorblind", n_colors=max(6, len(ks_sorted)))
+        cmap = plt.get_cmap("Blues_r")
+        if len(ks_sorted) > 1:
+            grad_vals = np.linspace(0.2, 0.9, len(ks_sorted))
+        else:
+            grad_vals = [0.6]
 
         for i, k_val in enumerate(ks_sorted):
             sub_k = sub_k_all[sub_k_all["top_k"] == k_val]
@@ -591,7 +596,7 @@ def plot_all(
                 y_vals,
                 marker="o",
                 linewidth=2.0,
-                color=colors[i % len(colors)],
+                color=cmap(grad_vals[i]),
                 label=f"k={int(k_val)}",
             )
 
@@ -600,7 +605,7 @@ def plot_all(
         ax.set_xlabel("Task")
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
-        ax.set_title(title_prefix)
+        ax.set_title(f"{title_prefix} - {'Train' if split == 'train' else 'Validation'}")
         ax.legend(
             loc="upper center",
             bbox_to_anchor=(0.5, -0.20),
@@ -658,7 +663,12 @@ def plot_all(
 
         fig_w = max(8.0, 1.2 * len(ordered_tasks) + 2.5)
         fig, ax = plt.subplots(figsize=(fig_w, 6.0))
-        colors = sns.color_palette("colorblind", n_colors=max(6, len(ks_sorted)))
+        # Blue gradient for k lines: lighter for higher k
+        cmap = plt.get_cmap("Blues_r")  # reversed so higher k -> lighter
+        if len(ks_sorted) > 1:
+            grad_vals = np.linspace(0.2, 0.9, len(ks_sorted))
+        else:
+            grad_vals = [0.6]
         scale = 100.0 if percent else 1.0
 
         for i, k_val in enumerate(ks_sorted):
@@ -677,7 +687,7 @@ def plot_all(
                 y_vals,
                 marker="o",
                 linewidth=2.0,
-                color=colors[i % len(colors)],
+                color=cmap(grad_vals[i]),
                 label=f"k={int(k_val)}",
             )
 
@@ -686,11 +696,12 @@ def plot_all(
         ax.set_xlabel("Task")
         ax.set_ylabel("Circuit reuse (%)" if percent else "Circuit reuse (fraction)")
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
-        ax.set_title(title_prefix)
+        ax.set_title(f"{title_prefix} - Reuse")
+        ncols = int(np.ceil(len(ks_sorted) / 2)) if len(ks_sorted) else 1
         ax.legend(
             loc="upper center",
-            bbox_to_anchor=(0.5, -0.20),
-            ncol=min(5, len(ks_sorted)),
+            bbox_to_anchor=(0.5, -0.24),
+            ncol=ncols,
             frameon=True,
         )
         if percent:
@@ -714,6 +725,135 @@ def plot_all(
             plt.show()
         plt.close()
 
+    # Helper: single plot across all tasks; for each task draw disjoint line segments across [Baseline, Ablated, Control] for each k
+    def _create_all_tasks_topk_condition_lines(
+        sub_k_all: pd.DataFrame,
+        split: str,
+        title_prefix: str,
+        filename_suffix: str,
+        include_control_local: bool,
+    ) -> None:
+        if sub_k_all.empty:
+            return
+
+        # Task ordering
+        if task_order == "alpha":
+            ordered_tasks = global_task_order
+        else:
+            tmp = (
+                sub_k_all.groupby(["task_display"], as_index=False)
+                .agg(
+                    base=(f"baseline_{split}_accuracy_mean", "mean"),
+                    abl=(f"ablation_{split}_accuracy_mean", "mean"),
+                )
+            )
+            if sort_by == "drop":
+                tmp = tmp.assign(drop=tmp["base"] - tmp["abl"]).sort_values("drop", ascending=False)
+            elif sort_by == "baseline":
+                tmp = tmp.sort_values("base", ascending=False)
+            elif sort_by == "ablation":
+                tmp = tmp.sort_values("abl", ascending=False)
+            else:
+                tmp = tmp.sort_values("task_display")
+            ordered_tasks = list(tmp["task_display"].values)
+
+        if not ordered_tasks:
+            return
+
+        # Conditions
+        cats = ["baseline", "ablation"]
+        if include_control_local and f"control_{split}_accuracy_mean" in sub_k_all.columns:
+            cats.append("control")
+        n_cats = len(cats)
+        # Within-task x offsets for conditions (centered around task index)
+        if n_cats == 3:
+            offsets = np.array([-0.25, 0.0, 0.25])
+        elif n_cats == 2:
+            offsets = np.array([-0.15, 0.15])
+        else:
+            offsets = np.linspace(-0.2, 0.2, n_cats)
+
+        # All k values
+        ks_all = sorted(sub_k_all["top_k"].dropna().unique())
+        if not ks_all:
+            return
+        cmap = plt.get_cmap("Blues_r")
+        grad_vals = np.linspace(0.2, 0.9, len(ks_all)) if len(ks_all) > 1 else [0.6]
+        k_to_color = {k: cmap(grad_vals[i]) for i, k in enumerate(ks_all)}
+
+        # Figure
+        fig_w = max(8.0, 1.3 * len(ordered_tasks) + 2.5)
+        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
+        scale = 100 if percent else 1
+
+        # Plot disjoint segments per task for each k
+        for k_val in ks_all:
+            sub_k = sub_k_all[sub_k_all["top_k"] == k_val]
+            color = k_to_color.get(k_val, cmap(0.6))
+            # For visibility, draw segments task-by-task so they don't connect across tasks
+            for ti, task in enumerate(ordered_tasks):
+                sub_t = sub_k[sub_k["task_display"] == task]
+                if sub_t.empty:
+                    continue
+                x_vals = ti + offsets[:n_cats]
+                y_vals = []
+                for c in cats:
+                    col = f"{c}_{split}_accuracy_mean"
+                    v = float(sub_t[col].mean()) if col in sub_t.columns else np.nan
+                    y_vals.append(v * scale if pd.notna(v) else np.nan)
+                ax.plot(
+                    x_vals,
+                    y_vals,
+                    marker="o",
+                    linewidth=2.0,
+                    color=color,
+                    label=f"k={int(k_val)}" if ti == 0 else None,
+                )
+
+        # Axes formatting
+        ax.set_xlabel("Task")
+        ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
+        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
+        ax.set_xticks(np.arange(len(ordered_tasks)))
+        ax.set_xticklabels(ordered_tasks, rotation=0, ha="center")
+        if percent:
+            ax.set_ylim(0, 110)
+        else:
+            # find max across lines
+            ymax = 0.0
+            for line in ax.get_lines():
+                ydata = line.get_ydata()
+                if len(ydata):
+                    cur_max = np.nanmax(ydata)
+                    if np.isfinite(cur_max):
+                        ymax = max(ymax, float(cur_max))
+            ax.set_ylim(0, max(1.0, ymax * 1.12))
+
+        # Add small tick marks for conditions per task (optional)
+        # We keep main ticks as tasks; markers indicate condition ordering
+
+        ax.set_title(f"{title_prefix} - {'Train' if split == 'train' else 'Validation'}")
+        # Legend for k values
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            n = len(labels)
+            ncols = int(np.ceil(n / 2)) 
+            ax.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.2),
+                ncol=ncols,
+                frameon=True,
+            )
+
+        fig.tight_layout(rect=[0, 0.08, 1, 1])
+        out_path = out_dir / filename_suffix
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        saved_files.append(out_path.name)
+        if show:
+            plt.show()
+        plt.close(fig)
+
     # Per-model plots: replace aggregated bars with multi-line plots by k
     for (model_disp, method_disp), _ in grouped.groupby(["model_display", "method_display"]):
         safe_model = safe_filename(model_disp)
@@ -724,17 +864,18 @@ def plot_all(
         if sub_k_all.empty:
             continue
 
-        # Train lines
+        # Train lines (faceted per task, each k is a line across conditions)
         has_train = (
             "baseline_train_total" in sub_k_all.columns
             and sub_k_all["baseline_train_total"].sum() > 0
         )
         if has_train:
-            _create_lines_across_k_by_task(
+            _create_all_tasks_topk_condition_lines(
                 sub_k_all.copy(),
                 "train",
                 f"{model_disp}",
                 f"{safe_model}/all_k/{safe_model}_{safe_method}_train_all_k.png",
+                include_control,
             )
 
         # Validation lines (only if present)
@@ -743,11 +884,12 @@ def plot_all(
             and sub_k_all["baseline_val_total"].sum() > 0
         )
         if has_val:
-            _create_lines_across_k_by_task(
+            _create_all_tasks_topk_condition_lines(
                 sub_k_all.copy(),
                 "val",
                 f"{model_disp}",
                 f"{safe_model}/all_k/{safe_model}_{safe_method}_val_all_k.png",
+                include_control,
             )
 
         # Reuse lines across tasks by k
@@ -777,7 +919,7 @@ def plot_all(
         ax.set_xlabel("top_k")
         ax.set_ylabel("Accuracy drop (pp)" if percent else "Accuracy drop")
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
-        ax.set_title(title_prefix)
+        ax.set_title(f"{title_prefix} - {'Train' if split == 'train' else 'Validation'}")
         ax.legend(loc="best")
         fig.tight_layout()
 
@@ -1011,8 +1153,8 @@ def main():
         percent=percent,
         overlay_scores=args.overlay_scores,
         include_control=not args.no_control,
-    ci_level=args.ci,
-    task_order=args.task_order,
+        ci_level=args.ci,
+        task_order=args.task_order,
     )
 
 

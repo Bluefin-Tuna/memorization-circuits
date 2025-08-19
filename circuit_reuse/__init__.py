@@ -3,4 +3,4 @@
 from .dataset import * # noqa: F401,F403
 from .evaluate import * # noqa: F401,F403
 from .circuit_extraction import * # noqa: F401,F403
-from .eap import * # noqa: F401,F403
+from .graph import * # noqa: F401,F403

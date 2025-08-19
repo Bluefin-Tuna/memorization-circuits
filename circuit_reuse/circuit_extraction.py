@@ -7,7 +7,7 @@ from transformer_lens import HookedTransformer
 from contextlib import nullcontext
 import gc
 
-from .eap import Graph, attribute_single_example
+from .graph import Graph, attribute_single_example, make_hooks
 from .dataset import Example
 
 
@@ -25,11 +25,12 @@ class Component:
 
 
 class CircuitExtractor:
-    def __init__(self, model: HookedTransformer, top_k: Optional[int] = 5) -> None:
+    def __init__(self, model: HookedTransformer, top_k: Optional[int] = 5, method: str = "eap") -> None:
         self.model = model
         self.top_k = top_k
+        self.method = method
         self.graph = Graph.from_model(model)
-        # Enable hooks needed for EAP
+        # Enable hooks needed for all methods
         self.model.cfg.use_split_qkv_input = True
         self.model.cfg.use_attn_result = True
         self.model.cfg.use_hook_mlp_in = True
@@ -40,13 +41,13 @@ class CircuitExtractor:
             # logits: [batch, pos, vocab]
             # positions: [m], target_ids: [m]
             logprobs = logits.log_softmax(dim=-1)
-            # Batch size is 1 in our EAP dataloader; index accordingly
+            # Batch size is 1; index accordingly
             selected = logprobs[0, positions, :].gather(dim=1, index=target_ids.view(-1, 1))
             return selected.sum()
         return metric
 
     def _scores_to_components(self, scores: torch.Tensor) -> Dict[Component, float]:
-        from .eap import InputNode, MLPNode, AttentionNode
+        from .graph import InputNode, MLPNode, AttentionNode
         component_scores: Dict[Component, float] = {}
         # scores has shape (n_forward, n_backward). Sum over backward dim to get score per source component.
         per_component_scores = scores.abs().sum(dim=1)
@@ -95,59 +96,108 @@ class CircuitExtractor:
         metric = self._get_metric_fn(positions=positions, target_ids=target_ids)
         
         return clean_tokens, corrupted_tokens, metric, max_len
+
+    def _prepare_gradient_inputs(self, example: Example):
+        """Prepares and tokenizes a single example for the gradient method."""
+        prompt_tok = self.model.to_tokens(example.prompt, prepend_bos=True)
+        clean_full_tok = self.model.to_tokens(example.prompt + example.target, prepend_bos=True)
+
+        device = self.model.cfg.device
+        p_ids, f_ids = prompt_tok.tolist()[0], clean_full_tok.tolist()[0]
+        lcp = 0
+        while lcp < len(p_ids) and lcp < len(f_ids) and p_ids[lcp] == f_ids[lcp]:
+            lcp += 1
+        
+        gold_ids_list = f_ids[lcp:] if lcp < len(f_ids) else self.model.to_tokens(example.target, prepend_bos=False).tolist()[0]
+        target_ids = torch.tensor(gold_ids_list, device=device, dtype=torch.long)
+        prompt_len = prompt_tok.shape[1]
+        positions = torch.arange(prompt_len - 1, prompt_len - 1 + len(gold_ids_list), device=device, dtype=torch.long)
+
+        metric = self._get_metric_fn(positions=positions, target_ids=target_ids)
+        
+        return clean_full_tok.to(device), metric, clean_full_tok.shape[1]
         
     def extract_circuits_from_examples(self, examples: List[Example], task_name: str, amp: bool, device: str) -> List[Set[Component]]:
         """
-        Extracts circuits for a list of examples using EAP with efficient memory management.
-        The large activation tensor is allocated once and reused.
+        Extracts circuits for a list of examples using the method specified in the constructor.
         """
-        circuits = []
         autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16) if amp and device.startswith("cuda") else nullcontext())
         
-        # Determine max sequence length across all examples to allocate the buffer once
-        max_seq_len = 0
-        all_tokenized = [self._prepare_eap_inputs(ex) for ex in examples]
-        for clean_tokens, corrupted_tokens, _, _ in all_tokenized:
-            max_seq_len = max(max_seq_len, clean_tokens.shape[1], corrupted_tokens.shape[1])
+        if self.method == "gradient":
+            circuits = []
+            max_seq_len = 0
+            all_tokenized = [self._prepare_gradient_inputs(ex) for ex in examples]
+            for clean_tokens, _, _ in all_tokenized:
+                max_seq_len = max(max_seq_len, clean_tokens.shape[1])
 
-        # Allocate the large tensor ONCE.
-        activation_difference = torch.zeros(
-            (1, max_seq_len, self.graph.n_forward, self.model.cfg.d_model),
-            device=self.model.cfg.device, dtype=self.model.cfg.dtype,
-        )
+            activations_buffer = torch.zeros(
+                (1, max_seq_len, self.graph.n_forward, self.model.cfg.d_model),
+                device=self.model.cfg.device, dtype=self.model.cfg.dtype,
+            )
 
-        for idx, (clean_tokens, corrupted_tokens, metric, seq_len) in enumerate(all_tokenized):
-            with autocast_ctx:
-                # Pad current example tokens to the max sequence length of the buffer
-                clean_pad = (0, max_seq_len - clean_tokens.shape[1])
-                corrupted_pad = (0, max_seq_len - corrupted_tokens.shape[1])
-                clean_tokens_padded = F.pad(clean_tokens, clean_pad, "constant", 0)
-                corrupted_tokens_padded = F.pad(corrupted_tokens, corrupted_pad, "constant", 0)
+            for idx, (clean_tokens, metric, seq_len) in enumerate(all_tokenized):
+                with autocast_ctx:
+                    scores = torch.zeros((self.graph.n_forward, self.graph.n_backward), device=self.model.cfg.device, dtype=self.model.cfg.dtype)
+                    activations_buffer.zero_()
+
+                    _, fwd_hooks_clean, bwd_hooks = make_hooks(self.model, self.graph, activations_buffer, scores)
+
+                    with self.model.hooks(fwd_hooks=fwd_hooks_clean, bwd_hooks=bwd_hooks):
+                        logits = self.model(clean_tokens)
+                        metric_value = metric(logits, None, None, None)
+                        metric_value.backward()
+                    
+                    self.model.zero_grad(set_to_none=True)
+                    self.model.reset_hooks()
                 
-                # Pass the pre-allocated tensor to the attribution function
-                scores = attribute_single_example(
-                    model=self.model,
-                    graph=self.graph,
-                    metric=metric,
-                    clean_tokens=clean_tokens_padded,
-                    corrupted_tokens=corrupted_tokens_padded,
-                    activation_difference=activation_difference,
-                )
-            
-            component_scores = self._scores_to_components(scores)
-            items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
-            comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
-            circuits.append(comp_set)
+                component_scores = self._scores_to_components(scores.cpu())
+                items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
+                comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
+                circuits.append(comp_set)
 
-            if (idx + 1) % 10 == 0 or (idx + 1) == len(examples):
-                print(f"[{task_name}] {idx + 1}/{len(examples)} train examples processed (last circuit size={len(comp_set)})")
+                if (idx + 1) % 10 == 0 or (idx + 1) == len(examples):
+                    print(f"[{task_name}] ({self.method}) {idx + 1}/{len(examples)} examples processed (last circuit size={len(comp_set)})")
 
-        # Cleanup
-        del activation_difference
-        gc.collect()
-        torch.cuda.empty_cache()
+            del activations_buffer
+            gc.collect()
+            torch.cuda.empty_cache()
+            return circuits
 
-        return circuits
+        elif self.method == "eap":
+            circuits = []
+            max_seq_len = 0
+            all_tokenized = [self._prepare_eap_inputs(ex) for ex in examples]
+            for clean_tokens, corrupted_tokens, _, _ in all_tokenized:
+                max_seq_len = max(max_seq_len, clean_tokens.shape[1], corrupted_tokens.shape[1])
+
+            activation_difference = torch.zeros(
+                (1, max_seq_len, self.graph.n_forward, self.model.cfg.d_model),
+                device=self.model.cfg.device, dtype=self.model.cfg.dtype,
+            )
+
+            for idx, (clean_tokens, corrupted_tokens, metric, seq_len) in enumerate(all_tokenized):
+                with autocast_ctx:
+                    scores = attribute_single_example(
+                        model=self.model, graph=self.graph, metric=metric,
+                        clean_tokens=clean_tokens, corrupted_tokens=corrupted_tokens,
+                        activation_difference=activation_difference,
+                    )
+                
+                component_scores = self._scores_to_components(scores)
+                items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
+                comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
+                circuits.append(comp_set)
+
+                if (idx + 1) % 10 == 0 or (idx + 1) == len(examples):
+                    print(f"[{task_name}] ({self.method}) {idx + 1}/{len(examples)} train examples processed (last circuit size={len(comp_set)})")
+
+            del activation_difference
+            gc.collect()
+            torch.cuda.empty_cache()
+            return circuits
+        
+        else:
+            raise ValueError(f"Unsupported method: {self.method}")
 
 
 def compute_shared_circuit(circuits: List[Set[Component]]) -> Set[Component]:

@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_examples_list", nargs="+", type=int, required=True, help="List of num_examples values.")
     parser.add_argument("--digits_list", nargs="+", type=int, required=True, help="List of digit counts (used only for addition).")
     parser.add_argument("--top_ks", nargs="+", type=int, required=True, help="List of top_k values.")
+    parser.add_argument("--method", type=str, default="eap", choices=["eap", "gradient"], help="Attribution method to use.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results")
@@ -61,12 +62,12 @@ def _enumerate_all_components(model: HookedTransformer) -> List[Component]:
 
 def _run_single_combination(
     model: HookedTransformer, model_name: str, task: str, num_examples: int, digits: int | None,
-    top_k: int, device: str, debug: bool, run_dir: Path, amp: bool, val_fraction: float,
+    top_k: int, device: str, debug: bool, run_dir: Path, amp: bool, val_fraction: float, method: str,
 ):
     dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
-    print(f"[{model_name}/{task}] Generated {len(dataset)} examples.")
+    print(f"[{model_name}/{task}] Generated {len(dataset)} examples for method '{method}'.")
 
-    extractor = CircuitExtractor(model, top_k=top_k)
+    extractor = CircuitExtractor(model, top_k=top_k, method=method)
 
     examples = list(dataset)
     random.shuffle(examples)
@@ -79,13 +80,11 @@ def _run_single_combination(
     if debug:
         print(f"[SPLIT] total={n} train={len(train_examples)} val={len(val_examples)} (val_fraction={vf:.2f})")
 
-    combo_key = f"{model_name}|{task}|eap|n{num_examples}|d{digits}|k{top_k}"
+    combo_key = f"{model_name}|{task}|{method}|n{num_examples}|d{digits}|k{top_k}"
     start = time.time()
     circuits: List[set] = []
     
     try:
-        # Instead of looping, we call a single method to process all examples.
-        # This new method will manage memory efficiently internally.
         circuits = extractor.extract_circuits_from_examples(
             examples=train_examples,
             task_name=task,
@@ -135,7 +134,7 @@ def _run_single_combination(
 
     metrics = {
         "model_name": model_name, "task": task, "num_examples": len(dataset),
-        "digits": digits if task == "addition" else None, "top_k": top_k, "method": "eap",
+        "digits": digits if task == "addition" else None, "top_k": top_k, "method": method,
         "baseline_train_accuracy": baseline_train_acc, "baseline_train_correct": baseline_train_correct,
         "baseline_train_total": baseline_train_total, "ablation_train_accuracy": ablation_train_acc,
         "ablation_train_correct": ablation_train_correct, "ablation_train_total": ablation_train_total,
@@ -192,7 +191,7 @@ def main() -> None:
                     for digits in digits_iter:
                         for num_examples in args.num_examples_list:
                             run_count += 1
-                            combo_name = f"{model_name.replace('/', '_')}__{task}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}"
+                            combo_name = f"{model_name.replace('/', '_')}__{task}__{args.method}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}"
                             run_dir = base_run_dir / combo_name
                             print(f"\n[RUN {run_count}/{total_runs}] {combo_name}")
                             
@@ -200,15 +199,15 @@ def main() -> None:
                                 _run_single_combination(
                                     model=model, model_name=model_name, task=task, num_examples=num_examples,
                                     digits=digits, top_k=top_k, device=args.device, debug=args.debug,
-                                    run_dir=run_dir, amp=args.amp, val_fraction=args.val_fraction
+                                    run_dir=run_dir, amp=args.amp, val_fraction=args.val_fraction, method=args.method
                                 )
                             except Exception as e:
                                 if "out of memory" in str(e).lower():
-                                     print(f"[OOM] Skipping {combo_name}: {e}")
+                                    print(f"[OOM] Skipping {combo_name}: {e}")
                                 else:
-                                     print(f"[ERROR] {combo_name} failed: {e}")
-                                     import traceback
-                                     traceback.print_exc()
+                                    print(f"[ERROR] {combo_name} failed: {e}")
+                                    import traceback
+                                    traceback.print_exc()
                             finally:
                                 if args.log_mem:
                                     print(f"[MEM] {combo_name} allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")

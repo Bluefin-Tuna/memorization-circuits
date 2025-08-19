@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import random
+import os
 from dataclasses import dataclass
 from typing import List, Tuple, Iterable
 from datasets import load_dataset
-import re
 
 
 @dataclass
@@ -216,8 +216,21 @@ class IOIDataset:
 class MCQADataset:
     """Loads the CopyColors MCQA dataset from MIB-bench."""
 
-    def __init__(self, split: str = "test", num_examples: int | None = None) -> None:
-        ds = load_dataset("mib-bench/copycolors_mcqa", split=split)
+    def __init__(
+        self,
+        split: str = "test",
+        num_examples: int | None = None,
+        n: int = 4,
+    ) -> None:
+        if not (2 <= n <= 10):
+            raise ValueError(f"MCQA 'n' must be in [2,10], got {n}")
+        
+        config = f"{n}_answer_choices"
+
+        # Hugging Face dataset requires a config per n-way subset
+        # e.g., "4_answer_choices". See dataset files for details.
+        # https://huggingface.co/datasets/mib-bench/copycolors_mcqa
+        ds = load_dataset("mib-bench/copycolors_mcqa", config, split=split)
         self._examples: List[Example] = []
         count = 0
         for item in ds:

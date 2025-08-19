@@ -75,7 +75,7 @@ def _mc_letter_token_id_groups(model) -> dict:
     for i in range(26):
         L = chr(ord("A") + i)
         ids = set()
-        for variant in (L, f" {L}", f"\n{L}"):
+        for variant in (L, f" {L}", f"\n{L}", f": {L}", f":\n{L}"):
             toks = model.to_tokens(variant, prepend_bos=False)
             t_ids = toks[0].tolist()
             if len(t_ids) == 1:
