@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Tuple, Any
+from typing import Iterable, List, Tuple, Any, Dict
 import torch
 from .dataset import Example
 from .circuit_extraction import Component
+from contextlib import nullcontext
 
 
 def _extract_gold_ids(model: Any, prompt: str, target: str, device, verbose: bool = False) -> List[int]:
@@ -169,4 +170,70 @@ def evaluate_accuracy_with_ablation(
     return correct, total
 
 
-__all__ = ["evaluate_accuracy", "evaluate_accuracy_with_ablation"]
+def evaluate_predictions(
+    model: Any,
+    dataset: Iterable[Example],
+    task: str,
+    removed: Iterable[Component] | None = None,
+    verbose: bool = False,
+) -> Tuple[int, int, List[Dict[str, Any]]]:
+    """
+    Evaluate and also return per-example predictions.
+
+    Returns:
+      correct, total, per_example list with:
+        {"prompt": str, "target": str, "pred": str, "is_correct": bool}
+      For generative tasks (e.g., addition), "pred" is the best-token id rendered if available.
+    """
+    model.eval()
+    hooks: List[Tuple[str, callable]] = []
+
+    if removed:
+        for comp in removed:
+            if comp.kind == "head":
+                def hook_head(act, hook=None, head_index=comp.index):
+                    if act.dim() == 4:
+                        act[:, :, head_index, :] = 0.0
+                    return act
+                hooks.append((f"blocks.{comp.layer}.attn.hook_result", hook_head))
+            elif comp.kind == "mlp":
+                def hook_mlp(act, hook=None):
+                    act[:, :, :] = 0.0
+                    return act
+                hooks.append((f"blocks.{comp.layer}.hook_mlp_out", hook_mlp))
+
+    per_ex: List[Dict[str, Any]] = []
+    correct, total = 0, 0
+    device = model.cfg.device
+
+    ctx = model.hooks(fwd_hooks=hooks) if hooks else nullcontext()
+
+    with ctx:
+        with torch.no_grad():
+            for ex in dataset:
+                logits = model(model.to_tokens(ex.prompt, prepend_bos=True).to(device))
+                logits_last = logits[0, -1]
+                if task == "boolean":
+                    pred_label, _ = _classify_boolean(logits_last, model, verbose=verbose)
+                    gold = ex.target
+                    ok = (pred_label == gold)
+                    per_ex.append({"prompt": ex.prompt, "target": gold, "pred": pred_label, "is_correct": bool(ok)})
+                    correct += int(ok)
+                elif task in ("mmlu", "mcqa", "arc_easy", "arc_challenge"):
+                    pred_label = _classify_multiple_choice(logits_last, model, verbose=verbose)
+                    gold = ex.target
+                    ok = (pred_label == gold)
+                    per_ex.append({"prompt": ex.prompt, "target": gold, "pred": pred_label, "is_correct": bool(ok)})
+                    correct += int(ok)
+                else:
+                    gold_ids = _extract_gold_ids(model, ex.prompt, ex.target, device=device, verbose=verbose)
+                    pred_id = int(logits_last.argmax().item())
+                    ok = (gold_ids and pred_id in gold_ids)
+                    per_ex.append({"prompt": ex.prompt, "target": ex.target, "pred_token_id": pred_id, "is_correct": bool(ok)})
+                    correct += int(ok)
+                total += 1
+
+    return correct, total, per_ex
+
+
+__all__ = ["evaluate_accuracy", "evaluate_accuracy_with_ablation", "evaluate_predictions"]

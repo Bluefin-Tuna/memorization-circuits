@@ -19,10 +19,7 @@ from circuit_reuse.dataset import (
     get_model_display_name,
 )
 
-METHOD_DISPLAY = {
-    "eap": "EAP",
-    "gradient": "Gradient",
-}
+METHOD_DISPLAY = {"eap": "EAP", "gradient": "Gradient"}
 
 
 def safe_filename(name: str) -> str:
@@ -106,20 +103,12 @@ def build_colors_for_models(models: List[str]) -> Dict[str, Tuple[float, float, 
     return {m: base[i % len(base)] for i, m in enumerate(models)}
 
 
-def plot_reuse_per_task_per_model(
-    gk: pd.DataFrame,
-    out_dir: Path,
-    percent: bool,
-):
-    if gk.empty or "shared_circuit_size_mean" not in gk.columns:
-        print("[INFO] No data for circuit reuse plot.")
+def plot_cis_per_task_per_model(gk: pd.DataFrame, out_dir: Path):
+    if gk.empty or "cis_mean" not in gk.columns:
+        print("[INFO] No data for cis plot.")
         return
 
     sub = gk.copy()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        sub["reuse_frac"] = sub["shared_circuit_size_mean"] / sub["top_k"].replace(0, np.nan)
-    sub["reuse_frac"] = sub["reuse_frac"].clip(lower=0).fillna(0.0)
-    scale = 100.0
 
     models = sorted(sub["model_display"].dropna().unique(), key=str)
     tasks = sorted(sub["task_display"].dropna().unique(), key=str)
@@ -153,7 +142,7 @@ def plot_reuse_per_task_per_model(
         tdf = sub[sub["task_display"] == task]
         for j, k in enumerate(ks):
             tk = tdf[tdf["top_k"] == k].set_index("model_display").reindex(models)
-            vals = (tk["reuse_frac"].values * scale).astype(float)
+            vals = tk["cis_mean"].values.astype(float)
             ax.bar(
                 x + offsets[j],
                 vals,
@@ -165,10 +154,10 @@ def plot_reuse_per_task_per_model(
 
         ax.set_title(task)
         if i % cols == 0:
-            ax.set_ylabel("Circuit reuse (%)")
+            ax.set_ylabel("Circuit identifiability score")
         ax.set_xticks(x)
         ax.set_xticklabels(models, rotation=20, ha="right")
-        ax.set_ylim(0, 100)
+        ax.set_ylim(0, 1.0)
         ax.grid(axis="y", linestyle="--", alpha=0.6, zorder=0)
         ax.margins(x=0.02, y=-0.05)
 
@@ -188,7 +177,7 @@ def plot_reuse_per_task_per_model(
         columnspacing=0.8,
     )
 
-    out = out_dir / "multiplot_reuse_per_task_per_model.png"
+    out = out_dir / "multiplot_cis_per_task_per_model.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=200, bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
@@ -435,7 +424,7 @@ def main():
     gk = (
         df.groupby(["task_display", "model_display", "top_k"], as_index=False)
         .agg(**{c: (c, "sum") for c in cols_present},
-             shared_circuit_size_mean=("shared_circuit_size", "mean"))
+             cis_mean=("circuit_identifiability_score", "mean"))
     )
 
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -451,12 +440,8 @@ def main():
     # Always use percentage scaling in plots.
     percent = True
     plot_drop_by_model_k_per_task(gk.copy(), out_dir, split=args.split, percent=percent)
-    plot_reuse_per_task_per_model(gk.copy(), out_dir, percent=percent)
+    plot_cis_per_task_per_model(gk.copy(), out_dir)
     plot_ablation_vs_control_by_task(gk.copy(), out_dir, split=args.split, percent=percent)
 
     if args.show:
         plt.show()
-
-
-if __name__ == "__main__":
-    main()

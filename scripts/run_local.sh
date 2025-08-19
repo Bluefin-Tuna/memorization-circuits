@@ -36,11 +36,13 @@ for MODEL_NAME in "${MODELS[@]}"; do
                     --model_name "$MODEL_NAME" \
                     --task "$TASK" \
                     --top_k "$TOP_K" \
+                    --example_k 50 \
                     --method "$METHOD" \
                     --digits "$DIGITS" \
                     --num_examples "$NUM_EXAMPLES" \
                     --dtype "$DTYPE" \
                     --device "$DEVICE" \
+                    --perm-trials 500 \
                     --run-name "$RUN_NAME" \
                     --output-dir "$OUT_DIR/$RUN_NAME" \
                     --debug \

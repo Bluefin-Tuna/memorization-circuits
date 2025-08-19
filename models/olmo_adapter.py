@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from sympy import li
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -94,7 +95,6 @@ class HFHookedOLMo:
         finally:
             self.reset_hooks()
 
-    # ----------------- internal helpers -----------------
 
     def _emit_fwd(self, name: str, tensor: torch.Tensor) -> None:
         for fn in self._active_fwd.get(name, []):
@@ -161,7 +161,6 @@ class HFHookedOLMo:
                 raise RuntimeError(f"Layer {li} has no .self_attn")
             attn = block.self_attn
 
-            # FIX: support kwargs-only calls for attention
             def _attn_pre(mod, args, kwargs, _li=li):
                 # input hidden states may come as positional or kwarg
                 x = None
@@ -188,9 +187,14 @@ class HFHookedOLMo:
                     return
                 if x.dim() == 3 and x.size(-1) == _n_heads * _d_head:
                     x4 = x.view(x.size(0), x.size(1), _n_heads, _d_head)
+                    # Emit and allow in-place modification by listeners
                     self._emit_fwd(f"blocks.{_li}.attn.hook_result", x4)
+                    # Re-flatten potentially modified view and pass it to module
+                    x_mod = x4.view_as(x)
+                    return (x_mod,), _kw
                 else:
                     self._emit_fwd(f"blocks.{_li}.attn.hook_result", x)
+                    return inputs, _kw
 
             self._persist_handles.append(self._register_pre_hook(o_proj, _o_proj_pre, with_kwargs=True))
 
@@ -212,7 +216,9 @@ class HFHookedOLMo:
                 self._attach_bwd(name, x)
 
             def _mlp_fwd(mod, inputs, out, _li=li):
+                # Emit and allow in-place modification by listeners; return out
                 self._emit_fwd(f"blocks.{_li}.hook_mlp_out", out)
+                return out
 
             self._persist_handles.append(self._register_pre_hook(mlp, _mlp_pre, with_kwargs=True))
             self._persist_handles.append(mlp.register_forward_hook(_mlp_fwd))
