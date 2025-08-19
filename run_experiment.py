@@ -33,6 +33,7 @@ def _prepare_run_dir(output_dir: str, run_name: str | None):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Circuit reuse experiment (single-run)")
     parser.add_argument("--model_name", type=str, required=True, help="Model name.")
+    parser.add_argument("--hf-revision", type=str, default=None, help="HF revision tag or commit (e.g., stage1-step20000-tokens42B)")
     parser.add_argument("--task", type=str, required=True, help="Task name.")
     parser.add_argument("--num_examples", type=int, required=True, help="Number of examples to generate/use.")
     parser.add_argument("--digits", type=int, default=None, help="Digit count (only used for addition task).")
@@ -177,8 +178,9 @@ def main() -> None:
     model = None
     try:
         print(f"[MODEL LOAD] Loading model {model_name} (dtype={args.dtype}) on {args.device}...")
+        dtype_map = {"bf16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
         torch_dtype = None if args.dtype == "auto" else dtype_map[args.dtype]
-        model = load_model_any(model_name, device=args.device, torch_dtype=torch_dtype)
+        model = load_model_any(model_name, device=args.device, torch_dtype=torch_dtype, revision=args.hf_revision)
         model.eval()
         if args.log_mem:
             print(f"[MEM] post-load allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
