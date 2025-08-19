@@ -531,49 +531,229 @@ def plot_all(
             plt.show()
         plt.close()
 
-    # Legacy per-model plots (bars by task), annotated as aggregated across k
-    for (model_disp, method_disp), sub_df in grouped.groupby(
-        ["model_display", "method_display"]
-    ):
+    # Helper: multi-line plots across tasks, one line per top_k (no averaging across k)
+    def _create_lines_across_k_by_task(
+        sub_k_all: pd.DataFrame,
+        split: str,
+        title_prefix: str,
+        filename_suffix: str,
+    ) -> None:
+        if sub_k_all.empty:
+            return
+
+        # Determine task ordering for consistent x-axis
+        if task_order == "alpha":
+            ordered_tasks = global_task_order
+            ord_map = {t: i for i, t in enumerate(ordered_tasks)}
+        else:
+            # Build an ordering using averages across k for this model/method
+            tmp = (
+                sub_k_all.groupby(["task_display"], as_index=False)
+                .agg(
+                    base=(f"baseline_{split}_accuracy_mean", "mean"),
+                    abl=(f"ablation_{split}_accuracy_mean", "mean"),
+                )
+            )
+            if sort_by == "drop":
+                tmp = tmp.assign(drop=tmp["base"] - tmp["abl"]).sort_values("drop", ascending=False)
+            elif sort_by == "baseline":
+                tmp = tmp.sort_values("base", ascending=False)
+            elif sort_by == "ablation":
+                tmp = tmp.sort_values("abl", ascending=False)
+            else:
+                tmp = tmp.sort_values("task_display")
+            ordered_tasks = list(tmp["task_display"].values)
+            ord_map = {t: i for i, t in enumerate(ordered_tasks)}
+
+        # Pivot per k over ordered tasks
+        ks_sorted = sorted(sub_k_all["top_k"].dropna().unique())
+        if not ks_sorted:
+            return
+
+        # Prepare figure size according to number of tasks
+        fig_w = max(8.0, 1.2 * len(ordered_tasks) + 2.5)
+        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
+
+        scale = 100 if percent else 1
+        colors = sns.color_palette("colorblind", n_colors=max(6, len(ks_sorted)))
+
+        for i, k_val in enumerate(ks_sorted):
+            sub_k = sub_k_all[sub_k_all["top_k"] == k_val]
+            # Build y values aligned to ordered_tasks (ablation only to avoid clutter)
+            y_map = {
+                row["task_display"]: row.get(f"ablation_{split}_accuracy_mean", np.nan)
+                for _, row in sub_k.iterrows()
+            }
+            y_vals = [y_map.get(t, np.nan) * scale for t in ordered_tasks]
+            x_vals = np.arange(len(ordered_tasks))
+            ax.plot(
+                x_vals,
+                y_vals,
+                marker="o",
+                linewidth=2.0,
+                color=colors[i % len(colors)],
+                label=f"k={int(k_val)}",
+            )
+
+        ax.set_xticks(np.arange(len(ordered_tasks)))
+        ax.set_xticklabels(ordered_tasks, rotation=0, ha="center")
+        ax.set_xlabel("Task")
+        ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
+        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
+        ax.set_title(title_prefix)
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.20),
+            ncol=min(5, len(ks_sorted)),
+            frameon=True,
+        )
+        # Y-limits with a bit of headroom
+        if percent:
+            ax.set_ylim(0, 110)
+        else:
+            # Compute max across plotted lines ignoring NaNs
+            ymax = 0.0
+            for line in ax.get_lines():
+                ydata = line.get_ydata()
+                if len(ydata):
+                    cur_max = np.nanmax(ydata)
+                    if np.isfinite(cur_max):
+                        ymax = max(ymax, float(cur_max))
+            ax.set_ylim(0, max(1.0, ymax * 1.12))
+
+        fig.tight_layout(rect=[0, 0.05, 1, 1])
+        out_path = out_dir / filename_suffix
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        saved_files.append(out_path.name)
+        if show:
+            plt.show()
+        plt.close()
+
+    # Helper: reuse fraction lines across tasks, one line per top_k
+    def _create_reuse_lines_across_k_by_task(
+        sub_k_all: pd.DataFrame,
+        title_prefix: str,
+        filename_suffix: str,
+    ) -> None:
+        if sub_k_all.empty:
+            return
+
+        if task_order == "alpha":
+            ordered_tasks = global_task_order
+            ord_map = {t: i for i, t in enumerate(ordered_tasks)}
+        else:
+            # Order by average reuse across k if requested by drop/baseline/ablation doesn't apply
+            tmp = (
+                sub_k_all.groupby(["task_display"], as_index=False)
+                .agg(shared_mean=("shared_circuit_size_mean", "mean"))
+            )
+            tmp = tmp.sort_values("task_display")
+            ordered_tasks = list(tmp["task_display"].values)
+            ord_map = {t: i for i, t in enumerate(ordered_tasks)}
+
+        ks_sorted = sorted(sub_k_all["top_k"].dropna().unique())
+        if not ks_sorted:
+            return
+
+        fig_w = max(8.0, 1.2 * len(ordered_tasks) + 2.5)
+        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
+        colors = sns.color_palette("colorblind", n_colors=max(6, len(ks_sorted)))
+        scale = 100.0 if percent else 1.0
+
+        for i, k_val in enumerate(ks_sorted):
+            sub_k = sub_k_all[sub_k_all["top_k"] == k_val]
+            # reuse fraction = shared_circuit_size_mean / k
+            y_map = {}
+            for _, row in sub_k.iterrows():
+                t = row["task_display"]
+                k = float(k_val) if k_val else np.nan
+                val = (row.get("shared_circuit_size_mean", np.nan) / k) if k and k > 0 else np.nan
+                y_map[t] = val
+            y_vals = [y_map.get(t, np.nan) * scale for t in ordered_tasks]
+            x_vals = np.arange(len(ordered_tasks))
+            ax.plot(
+                x_vals,
+                y_vals,
+                marker="o",
+                linewidth=2.0,
+                color=colors[i % len(colors)],
+                label=f"k={int(k_val)}",
+            )
+
+        ax.set_xticks(np.arange(len(ordered_tasks)))
+        ax.set_xticklabels(ordered_tasks, rotation=0, ha="center")
+        ax.set_xlabel("Task")
+        ax.set_ylabel("Circuit reuse (%)" if percent else "Circuit reuse (fraction)")
+        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
+        ax.set_title(title_prefix)
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.20),
+            ncol=min(5, len(ks_sorted)),
+            frameon=True,
+        )
+        if percent:
+            ax.set_ylim(0, 110)
+        else:
+            ymax = 0.0
+            for line in ax.get_lines():
+                ydata = line.get_ydata()
+                if len(ydata):
+                    cur_max = np.nanmax(ydata)
+                    if np.isfinite(cur_max):
+                        ymax = max(ymax, float(cur_max))
+            ax.set_ylim(0, max(1.0, ymax * 1.12))
+
+        fig.tight_layout(rect=[0, 0.05, 1, 1])
+        out_path = out_dir / filename_suffix
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        saved_files.append(out_path.name)
+        if show:
+            plt.show()
+        plt.close()
+
+    # Per-model plots: replace aggregated bars with multi-line plots by k
+    for (model_disp, method_disp), _ in grouped.groupby(["model_display", "method_display"]):
         safe_model = safe_filename(model_disp)
         safe_method = safe_filename(method_disp.lower())
 
-        if (
-            "baseline_train_accuracy_mean" in sub_df.columns
-            and "ablation_train_accuracy_mean" in sub_df.columns
-        ):
-            _create_plot(
-                sub_df,
-                "baseline_train_accuracy_mean",
-                "ablation_train_accuracy_mean",
-                f"{model_disp} - {method_disp} (Train) [aggregated across k]",
+        # Collect all rows for this model/method across tasks and ks
+        sub_k_all = grouped_k[(grouped_k["model_display"] == model_disp) & (grouped_k["method_display"] == method_disp)]
+        if sub_k_all.empty:
+            continue
+
+        # Train lines
+        has_train = (
+            "baseline_train_total" in sub_k_all.columns
+            and sub_k_all["baseline_train_total"].sum() > 0
+        )
+        if has_train:
+            _create_lines_across_k_by_task(
+                sub_k_all.copy(),
+                "train",
+                f"{model_disp}",
                 f"{safe_model}/all_k/{safe_model}_{safe_method}_train_all_k.png",
-                control_col=(
-                    "control_train_accuracy_mean" if include_control else None
-                ),
             )
 
+        # Validation lines (only if present)
         has_val = (
-            "baseline_val_accuracy_mean" in sub_df.columns
-            and "ablation_val_accuracy_mean" in sub_df.columns
-            and sub_df["baseline_val_total"].sum() > 0
+            "baseline_val_total" in sub_k_all.columns
+            and sub_k_all["baseline_val_total"].sum() > 0
         )
         if has_val:
-            _create_plot(
-                sub_df,
-                "baseline_val_accuracy_mean",
-                "ablation_val_accuracy_mean",
-                f"{model_disp} - {method_disp} (Validation) [aggregated across k]",
+            _create_lines_across_k_by_task(
+                sub_k_all.copy(),
+                "val",
+                f"{model_disp}",
                 f"{safe_model}/all_k/{safe_model}_{safe_method}_val_all_k.png",
-                control_col=(
-                    "control_val_accuracy_mean" if include_control else None
-                ),
             )
 
-        # Circuit reuse (%) per task
-        _create_reuse_plot(
-            sub_df,
-            f"{model_disp} - {method_disp} [aggregated across k]",
+        # Reuse lines across tasks by k
+        _create_reuse_lines_across_k_by_task(
+            sub_k_all.copy(),
+            f"{model_disp}",
             f"{safe_model}/all_k/{safe_model}_{safe_method}_reuse_all_k.png",
         )
 
@@ -593,11 +773,11 @@ def plot_all(
         drop = (base - abl) * scale
 
         fig, ax = plt.subplots(figsize=(7.5, 5.0))
-        ax.plot(ks, drop, marker="o", linewidth=2.0, color=base_palette[4], label="Drop (Baseline - Ablated)")
+        ax.plot(ks, drop, marker="o", linewidth=2.0, color=base_palette[4], label="Drop")
         ax.set_xlabel("top_k")
         ax.set_ylabel("Accuracy drop (pp)" if percent else "Accuracy drop")
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
-        ax.set_title(f"{title_prefix} - Accuracy Drop vs top_k (k-sweep, {split.title()})")
+        ax.set_title(title_prefix)
         ax.legend(loc="best")
         fig.tight_layout()
 
@@ -659,7 +839,7 @@ def plot_all(
         if percent:
             ax.set_ylim(0, 110)
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
-        ax.set_title(f"{model_disp} - {method_disp} (k={k_val})")
+        ax.set_title(f"{model_disp}")
 
         # Annotate values
         ymax_current = ax.get_ylim()[1]
@@ -692,7 +872,7 @@ def plot_all(
             safe_model = safe_filename(model_disp)
             safe_task = safe_filename(task_disp)
             safe_method = safe_filename(method_disp.lower())
-            title_prefix = f"{model_disp} - {method_disp} - {task_disp}"
+            title_prefix = f"{model_disp} - {task_disp}"
             filename_prefix = f"{safe_model}/{safe_task}/{safe_model}_{safe_method}_{safe_task}"
 
             has_val = (
@@ -715,7 +895,7 @@ def plot_all(
                 sub_k_df,
                 "baseline_train_accuracy_mean",
                 "ablation_train_accuracy_mean",
-                f"{model_disp} - {method_disp} (Train, k={int(k_val)})",
+                f"{model_disp}",
                 f"{safe_model}/{int(k_val)}/{safe_model}_{safe_method}_k{int(k_val)}_train.png",
                 control_col=(
                     "control_train_accuracy_mean" if include_control else None
@@ -732,7 +912,7 @@ def plot_all(
                     sub_k_df,
                     "baseline_val_accuracy_mean",
                     "ablation_val_accuracy_mean",
-                    f"{model_disp} - {method_disp} (Validation, k={int(k_val)})",
+                    f"{model_disp}",
                     f"{safe_model}/{int(k_val)}/{safe_model}_{safe_method}_k{int(k_val)}_val.png",
                     control_col=(
                         "control_val_accuracy_mean" if include_control else None

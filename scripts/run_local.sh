@@ -2,7 +2,7 @@
 set -euo pipefail
 
 models=("qwen3-0.6b")
-tasks=("addition" "ioi" "mcqa" "arc_easy" "arc_challenge") 
+tasks=("ioi" "mcqa" "arc_easy" "arc_challenge") 
 top_ks=(5)
 digits_list=(2)
 num_examples_list=(10) 
