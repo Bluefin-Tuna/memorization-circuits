@@ -296,15 +296,21 @@ DATASET_DISPLAY_NAMES: dict[str, str] = {
     "addition": "Addition",
     "boolean": "Boolean",
     "mmlu": "MMLU",
-    "ioi": "MIB: IOI",
-    "mcqa": "MIB: MCQA",
-    "arc_easy": "MIB: ARC (Easy)",
-    "arc_challenge": "MIB: ARC (Challenge)",
+    "ioi": "IOI",
+    "mcqa": "Colored Objects MCQA",
+    "arc_easy": "ARC (Easy)",
+    "arc_challenge": "ARC (Challenge)",
 }
 
 MODEL_DISPLAY_NAMES: dict[str, str] = {
     "qwen3-0.6b": "Qwen3-0.6B",
     "qwen3-1.7b": "Qwen3-1.7B",
+    "qwen3-4b": "Qwen3-4B",
+    "qwen3-8b": "Qwen3-8B",
+    "meta-llama/Llama-3.2-3B": "Llama-3.2-3B",
+    "meta-llama/Llama-3.2-3B-Instruct": "Llama-3.2-3B Instruct",
+    "gemma-2-2b": "Gemma 2 2B",
+    "gemma-2-2b-it": "Gemma 2 2B Instruct",
 }
 
 

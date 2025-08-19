@@ -1,42 +1,55 @@
 #!/bin/bash
 set -euo pipefail
 
-models=("qwen3-0.6b")
-# tasks=("ioi" "mcqa" "arc_easy" "arc_challenge") 
-tasks=("ioi")
-top_ks=(5)
-methods=("eap" "gradient")
-digits_list=(2)
-num_examples_list=(10) 
+DIGITS=2
+NUM_EXAMPLES=10
+DTYPE="bf16"
+DEVICE="cpu"
+OUT_DIR="results"
 
-# Enumerate combinations
-for model in "${models[@]}"; do
-  for task in "${tasks[@]}"; do
-    for method in "${methods[@]}"; do
-      for topk in "${top_ks[@]}"; do
-        for digits in "${digits_list[@]}"; do
-          for numex in "${num_examples_list[@]}"; do
-            echo "---"
-            echo "[RUNNING] Model: $model, Task: $task, TopK: $topk, Method: $method, Digits: $digits, Examples: $numex"
+MODELS=(
+    "qwen3-0.6b"
+)
+TASKS=(
+    "ioi"
+)
+METHODS=(
+    "eap"
+)
+TOP_K_LIST=(
+    5
+)
 
-            python run_experiment.py \
-                --model_names "$model" \
-                --tasks "$task" \
-                --top_ks "$topk" \
-                --method "$method" \
-                --digits_list "$digits" \
-                --num_examples_list "$numex" \
-                --dtype bf16 \
-                --device cpu \
-                --run-name "local_test" \
-                --output-dir results \
-                --debug
-          done
+mkdir -p "$OUT_DIR"
+RUN_PREFIX="local_sweep_$(date +%Y%m%d_%H%M%S)"
+
+for MODEL_NAME in "${MODELS[@]}"; do
+    for TASK in "${TASKS[@]}"; do
+        for METHOD in "${METHODS[@]}"; do
+            for TOP_K in "${TOP_K_LIST[@]}"; do
+                MODEL_SAFE=${MODEL_NAME//\//-}
+                RUN_NAME="${RUN_PREFIX}_${TASK}_${METHOD}_k${TOP_K}_${MODEL_SAFE}"
+
+                echo "[RUNNING] Model: $MODEL_NAME, Task: $TASK, Method: $METHOD, TopK: $TOP_K, Digits: $DIGITS, Examples: $NUM_EXAMPLES"
+
+                python run_experiment.py \
+                    --model_name "$MODEL_NAME" \
+                    --task "$TASK" \
+                    --top_k "$TOP_K" \
+                    --method "$METHOD" \
+                    --digits "$DIGITS" \
+                    --num_examples "$NUM_EXAMPLES" \
+                    --dtype "$DTYPE" \
+                    --device "$DEVICE" \
+                    --run-name "$RUN_NAME" \
+                    --output-dir "$OUT_DIR/$RUN_NAME" \
+                    --debug \
+                || { echo "[ERROR] Failed for $RUN_NAME"; continue; }
+
+                echo "[DONE] Completed: $RUN_NAME"
+            done
         done
-      done
     done
-  done
 done
 
-echo ""
-echo "[DONE] Completed all local test experiments."
+echo "[DONE] Sweep finished."

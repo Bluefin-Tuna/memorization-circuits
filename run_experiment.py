@@ -10,7 +10,7 @@ import random
 import hashlib
 
 import torch
-from transformer_lens import HookedTransformer
+from models.olmo_adapter import load_model_any
 
 from circuit_reuse.dataset import get_dataset, Example
 from circuit_reuse.circuit_extraction import CircuitExtractor, compute_shared_circuit, Component
@@ -31,25 +31,25 @@ def _prepare_run_dir(output_dir: str, run_name: str | None):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Circuit reuse experiment (multi-run only)")
-    parser.add_argument("--model_names", nargs="+", type=str, required=True, help="List of model names.")
-    parser.add_argument("--tasks", nargs="+", type=str, required=True, help="List of tasks.")
-    parser.add_argument("--num_examples_list", nargs="+", type=int, required=True, help="List of num_examples values.")
-    parser.add_argument("--digits_list", nargs="+", type=int, required=True, help="List of digit counts (used only for addition).")
-    parser.add_argument("--top_ks", nargs="+", type=int, required=True, help="List of top_k values.")
+    parser = argparse.ArgumentParser(description="Circuit reuse experiment (single-run)")
+    parser.add_argument("--model_name", type=str, required=True, help="Model name.")
+    parser.add_argument("--task", type=str, required=True, help="Task name.")
+    parser.add_argument("--num_examples", type=int, required=True, help="Number of examples to generate/use.")
+    parser.add_argument("--digits", type=int, default=None, help="Digit count (only used for addition task).")
+    parser.add_argument("--top_k", type=int, required=True, help="Top-k components per example for extraction.")
     parser.add_argument("--method", type=str, default="eap", choices=["eap", "gradient"], help="Attribution method to use.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "float16", "float32"], help="Model/load dtype to reduce memory (bf16 recommended).")
-    parser.add_argument("--log-mem", action="store_true", help="Print CUDA memory after each combo.")
+    parser.add_argument("--log-mem", action="store_true", help="Print CUDA memory after the run.")
     parser.add_argument("--amp", action="store_true", help="Use autocast (mixed precision) during extraction.")
     parser.add_argument("--val-fraction", type=float, default=0.2, help="Fraction of dataset held out for validation evaluation (NOT used for circuit extraction). 0 disables validation.")
     return parser.parse_args()
 
 
-def _enumerate_all_components(model: HookedTransformer) -> List[Component]:
+def _enumerate_all_components(model) -> List[Component]:
     n_layers = model.cfg.n_layers
     n_heads = model.cfg.n_heads
     comps: List[Component] = []
@@ -61,7 +61,7 @@ def _enumerate_all_components(model: HookedTransformer) -> List[Component]:
 
 
 def _run_single_combination(
-    model: HookedTransformer, model_name: str, task: str, num_examples: int, digits: int | None,
+    model, model_name: str, task: str, num_examples: int, digits: int | None,
     top_k: int, device: str, debug: bool, run_dir: Path, amp: bool, val_fraction: float, method: str,
 ):
     dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
@@ -166,62 +166,60 @@ def main() -> None:
     args = parse_args()
     base_run_dir = _prepare_run_dir(args.output_dir, args.run_name)
     if args.log_mem:
-        print(f"Models: {args.model_names}, Tasks: {args.tasks}")
+        print(f"Model: {args.model_name}, Task: {args.task}")
 
     dtype_map = {"bf16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     
-    total_runs = len(args.model_names) * len(args.tasks) * len(args.top_ks) * (len(args.digits_list) if "addition" in args.tasks else 1) * len(args.num_examples_list)
+    total_runs = 1
     run_count = 0
 
-    for model_name in args.model_names:
-        model = None
+    model_name = args.model_name
+    model = None
+    try:
+        print(f"[MODEL LOAD] Loading model {model_name} (dtype={args.dtype}) on {args.device}...")
+        torch_dtype = None if args.dtype == "auto" else dtype_map[args.dtype]
+        model = load_model_any(model_name, device=args.device, torch_dtype=torch_dtype)
+        model.eval()
+        if args.log_mem:
+            print(f"[MEM] post-load allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
+
+        task = args.task
+        digits = args.digits if task == "addition" else None
+        top_k = args.top_k
+        num_examples = args.num_examples
+
+        run_count += 1
+        combo_name = f"{model_name.replace('/', '_')}__{task}__{args.method}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}"
+        run_dir = base_run_dir / combo_name
+        print(f"\n[RUN {run_count}/{total_runs}] {combo_name}")
+
         try:
-            print(f"[MODEL LOAD] Loading model {model_name} (dtype={args.dtype}) on {args.device}...")
-            load_kwargs = {"trust_remote_code": True}
-            if args.dtype != "auto":
-                load_kwargs["torch_dtype"] = dtype_map[args.dtype]
-            model = HookedTransformer.from_pretrained(model_name, **load_kwargs)
-            model.to(args.device).eval()
-            if args.log_mem:
-                print(f"[MEM] post-load allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
-
-            for task in args.tasks:
-                digits_iter = args.digits_list if task == "addition" else [None]
-                for top_k in args.top_ks:
-                    for digits in digits_iter:
-                        for num_examples in args.num_examples_list:
-                            run_count += 1
-                            combo_name = f"{model_name.replace('/', '_')}__{task}__{args.method}__n{num_examples}__d{digits if task=='addition' else 'na'}__k{top_k}"
-                            run_dir = base_run_dir / combo_name
-                            print(f"\n[RUN {run_count}/{total_runs}] {combo_name}")
-                            
-                            try:
-                                _run_single_combination(
-                                    model=model, model_name=model_name, task=task, num_examples=num_examples,
-                                    digits=digits, top_k=top_k, device=args.device, debug=args.debug,
-                                    run_dir=run_dir, amp=args.amp, val_fraction=args.val_fraction, method=args.method
-                                )
-                            except Exception as e:
-                                if "out of memory" in str(e).lower():
-                                    print(f"[OOM] Skipping {combo_name}: {e}")
-                                else:
-                                    print(f"[ERROR] {combo_name} failed: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                            finally:
-                                if args.log_mem:
-                                    print(f"[MEM] {combo_name} allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
-                                model.reset_hooks()
-
+            _run_single_combination(
+                model=model, model_name=model_name, task=task, num_examples=num_examples,
+                digits=digits, top_k=top_k, device=args.device, debug=args.debug,
+                run_dir=run_dir, amp=args.amp, val_fraction=args.val_fraction, method=args.method
+            )
         except Exception as e:
-            print(f"[FATAL] Failed to process model {model_name}: {e}")
+            if "out of memory" in str(e).lower():
+                print(f"[OOM] Skipping {combo_name}: {e}")
+            else:
+                print(f"[ERROR] {combo_name} failed: {e}")
+                import traceback
+                traceback.print_exc()
         finally:
-            # Clean up model and cache after all tasks for it are done
-            if model is not None:
-                del model
-            torch.cuda.empty_cache()
             if args.log_mem:
-                print(f"[MEM] after-model-del allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
+                print(f"[MEM] {combo_name} allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
+            model.reset_hooks()
+
+    except Exception as e:
+        print(f"[FATAL] Failed to process model {model_name}: {e}")
+    finally:
+        # Clean up model and cache after all tasks for it are done
+        if model is not None:
+            del model
+        torch.cuda.empty_cache()
+        if args.log_mem:
+            print(f"[MEM] after-model-del allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
     
     print(f"[ALL DONE] Completed {run_count}/{total_runs} runs. Results root: {base_run_dir}")
 
