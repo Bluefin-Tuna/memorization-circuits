@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ci",
         type=float,
-        default=0.95,
+        default=-1,
         help=(
             "Confidence level for error bars (e.g., 0.95 for 95% CI). "
             "Use -1 to disable error bars."
@@ -363,7 +363,7 @@ def plot_all(
         ]
 
         fig_w = max(8.0, 1.2 * len(tasks) + 2.5)
-        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
+        fig, ax = plt.subplots(figsize=(fig_w, 8.5))
 
         error_kwargs = dict(
             elinewidth=1.2,
@@ -388,7 +388,6 @@ def plot_all(
             )
 
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
-        ax.set_xlabel("Task")
 
         vals_for_max = [v for v in val_arrays if v is not None]
         if percent:
@@ -406,17 +405,22 @@ def plot_all(
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
 
         ax.set_xticks(x)
-        ax.set_xticklabels(tasks, rotation=0, ha="center")
+        ax.set_xticklabels(tasks, rotation=30, ha="right")
         ax.set_title(title_suffix)
 
-        ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.20),
-            ncol=n_bars,
-            frameon=True,
-        )
-
-        fig.tight_layout(rect=[0, 0.05, 1, 1])
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            fig.tight_layout(rect=[0, 0.15, 1, 1])
+            fig.legend(
+                handles,
+                labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.1),
+                ncol=len(labels),
+                frameon=True,
+            )
+        else:
+            fig.tight_layout(rect=[0, 0.05, 1, 1])
 
         # Annotate bar values
         ymax_current = ax.get_ylim()[1]
@@ -495,9 +499,8 @@ def plot_all(
         ax.set_ylabel(
             "Circuit reuse (%)" if percent else "Circuit reuse (fraction)"
         )
-        ax.set_xlabel("Task")
         ax.set_xticks(x)
-        ax.set_xticklabels(tasks, rotation=0, ha="center")
+        ax.set_xticklabels(tasks, rotation=30, ha="right")
         # Add headroom so labels don't clash with the top of the axes
         if percent:
             ax.set_ylim(0, 110)
@@ -573,7 +576,8 @@ def plot_all(
 
         # Prepare figure size according to number of tasks
         fig_w = max(8.0, 1.2 * len(ordered_tasks) + 2.5)
-        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
+        # Taller figure for accuracy lines
+        fig, ax = plt.subplots(figsize=(fig_w, 8.0))
 
         scale = 100 if percent else 1
         cmap = plt.get_cmap("Blues_r")
@@ -601,17 +605,24 @@ def plot_all(
             )
 
         ax.set_xticks(np.arange(len(ordered_tasks)))
-        ax.set_xticklabels(ordered_tasks, rotation=0, ha="center")
-        ax.set_xlabel("Task")
+        ax.set_xticklabels(ordered_tasks, rotation=30, ha="right")
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
         ax.set_title(f"{title_prefix} - {'Train' if split == 'train' else 'Validation'}")
-        ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.20),
-            ncol=min(5, len(ks_sorted)),
-            frameon=True,
-        )
+        # Move legend to figure-level under the axes to avoid overlap, and reserve bottom space
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            fig.tight_layout(rect=[0, 0.15, 1, 1])
+            fig.legend(
+                handles,
+                labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.1),
+                ncol=min(5, len(labels)),
+                frameon=True,
+            )
+        else:
+            fig.tight_layout(rect=[0, 0.05, 1, 1])
         # Y-limits with a bit of headroom
         if percent:
             ax.set_ylim(0, 110)
@@ -692,30 +703,26 @@ def plot_all(
             )
 
         ax.set_xticks(np.arange(len(ordered_tasks)))
-        ax.set_xticklabels(ordered_tasks, rotation=0, ha="center")
-        ax.set_xlabel("Task")
+        ax.set_xticklabels(ordered_tasks, rotation=30, ha="right")
         ax.set_ylabel("Circuit reuse (%)" if percent else "Circuit reuse (fraction)")
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
         ax.set_title(f"{title_prefix} - Reuse")
-        ncols = int(np.ceil(len(ks_sorted) / 2)) if len(ks_sorted) else 1
-        ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.24),
-            ncol=ncols,
-            frameon=True,
-        )
-        if percent:
-            ax.set_ylim(0, 110)
+        # Move legend to figure-level under the axes to avoid overlap, and reserve bottom space
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            fig.tight_layout(rect=[0, 0.18, 1, 1])
+            fig.legend(
+                handles,
+                labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.1),
+                ncol=int(np.ceil(len(labels) / 2)) if labels else 1,
+                frameon=True,
+            )
         else:
-            ymax = 0.0
-            for line in ax.get_lines():
-                ydata = line.get_ydata()
-                if len(ydata):
-                    cur_max = np.nanmax(ydata)
-                    if np.isfinite(cur_max):
-                        ymax = max(ymax, float(cur_max))
-            ax.set_ylim(0, max(1.0, ymax * 1.12))
+            fig.tight_layout(rect=[0, 0.05, 1, 1])
 
+        # Final layout and save
         fig.tight_layout(rect=[0, 0.05, 1, 1])
         out_path = out_dir / filename_suffix
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -783,8 +790,8 @@ def plot_all(
 
         # Figure
         fig_w = max(8.0, 1.3 * len(ordered_tasks) + 2.5)
-        fig, ax = plt.subplots(figsize=(fig_w, 6.0))
-        scale = 100 if percent else 1
+        # Taller figure so condition lines and markers have more vertical room
+        fig, ax = plt.subplots(figsize=(fig_w, 8.0))
 
         # Plot disjoint segments per task for each k
         for k_val in ks_all:
@@ -811,11 +818,10 @@ def plot_all(
                 )
 
         # Axes formatting
-        ax.set_xlabel("Task")
         ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
         ax.set_xticks(np.arange(len(ordered_tasks)))
-        ax.set_xticklabels(ordered_tasks, rotation=0, ha="center")
+        ax.set_xticklabels(ordered_tasks, rotation=30, ha="right")
         if percent:
             ax.set_ylim(0, 110)
         else:
@@ -829,23 +835,23 @@ def plot_all(
                         ymax = max(ymax, float(cur_max))
             ax.set_ylim(0, max(1.0, ymax * 1.12))
 
-        # Add small tick marks for conditions per task (optional)
-        # We keep main ticks as tasks; markers indicate condition ordering
-
-        ax.set_title(f"{title_prefix} - {'Train' if split == 'train' else 'Validation'}")
-        # Legend for k values
+        # Use a figure-level legend below the axes to avoid overlap, reserve bottom space
         handles, labels = ax.get_legend_handles_labels()
         if handles:
             n = len(labels)
-            ncols = int(np.ceil(n / 2)) 
-            ax.legend(
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.2),
+            ncols = int(np.ceil(n / 2))
+            fig.tight_layout(rect=[0, 0.18, 1, 1])
+            fig.legend(
+                handles,
+                labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.1),
                 ncol=ncols,
                 frameon=True,
             )
+        else:
+            fig.tight_layout(rect=[0, 0.08, 1, 1])
 
-        fig.tight_layout(rect=[0, 0.08, 1, 1])
         out_path = out_dir / filename_suffix
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -853,51 +859,6 @@ def plot_all(
         if show:
             plt.show()
         plt.close(fig)
-
-    # Per-model plots: replace aggregated bars with multi-line plots by k
-    for (model_disp, method_disp), _ in grouped.groupby(["model_display", "method_display"]):
-        safe_model = safe_filename(model_disp)
-        safe_method = safe_filename(method_disp.lower())
-
-        # Collect all rows for this model/method across tasks and ks
-        sub_k_all = grouped_k[(grouped_k["model_display"] == model_disp) & (grouped_k["method_display"] == method_disp)]
-        if sub_k_all.empty:
-            continue
-
-        # Train lines (faceted per task, each k is a line across conditions)
-        has_train = (
-            "baseline_train_total" in sub_k_all.columns
-            and sub_k_all["baseline_train_total"].sum() > 0
-        )
-        if has_train:
-            _create_all_tasks_topk_condition_lines(
-                sub_k_all.copy(),
-                "train",
-                f"{model_disp}",
-                f"{safe_model}/all_k/{safe_model}_{safe_method}_train_all_k.png",
-                include_control,
-            )
-
-        # Validation lines (only if present)
-        has_val = (
-            "baseline_val_total" in sub_k_all.columns
-            and sub_k_all["baseline_val_total"].sum() > 0
-        )
-        if has_val:
-            _create_all_tasks_topk_condition_lines(
-                sub_k_all.copy(),
-                "val",
-                f"{model_disp}",
-                f"{safe_model}/all_k/{safe_model}_{safe_method}_val_all_k.png",
-                include_control,
-            )
-
-        # Reuse lines across tasks by k
-        _create_reuse_lines_across_k_by_task(
-            sub_k_all.copy(),
-            f"{model_disp}",
-            f"{safe_model}/all_k/{safe_model}_{safe_method}_reuse_all_k.png",
-        )
 
     def _create_drop_vs_k_plot(
         sub_k: pd.DataFrame,
@@ -914,7 +875,8 @@ def plot_all(
         scale = 100 if percent else 1
         drop = (base - abl) * scale
 
-        fig, ax = plt.subplots(figsize=(7.5, 5.0))
+        # Slightly taller so the drop-vs-k curve has more vertical space
+        fig, ax = plt.subplots(figsize=(7.5, 6.5))
         ax.plot(ks, drop, marker="o", linewidth=2.0, color=base_palette[4], label="Drop")
         ax.set_xlabel("top_k")
         ax.set_ylabel("Accuracy drop (pp)" if percent else "Accuracy drop")
@@ -975,9 +937,8 @@ def plot_all(
         ax.set_ylabel(
             "Circuit reuse (%)" if percent else "Circuit reuse (fraction)"
         )
-        ax.set_xlabel("Task")
         ax.set_xticks(x)
-        ax.set_xticklabels(tasks, rotation=0, ha="center")
+        ax.set_xticklabels(tasks, rotation=30, ha="right")
         if percent:
             ax.set_ylim(0, 110)
         ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
