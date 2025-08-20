@@ -77,6 +77,10 @@ class HFHookedOLMo:
             return torch.tensor([ids], device=self.cfg.device, dtype=torch.long)
         toks = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         return toks["input_ids"].to(self.cfg.device)
+    
+    def zero_grad(self, set_to_none: bool = True):
+        self.model.zero_grad(set_to_none=set_to_none)
+        return self
 
     @contextmanager
     def hooks(
@@ -120,9 +124,6 @@ class HFHookedOLMo:
         tensor.register_hook(_on_grad)
 
     def _register_pre_hook(self, module: nn.Module, fn, with_kwargs=True):
-        """
-        Try new API with with_kwargs=True; fall back if not supported.
-        """
         try:
             return module.register_forward_pre_hook(fn, with_kwargs=with_kwargs)
         except TypeError:
@@ -136,22 +137,20 @@ class HFHookedOLMo:
 
         # hook_embed
         emb = model.get_input_embeddings()
-
         def _embed_fwd(_mod, _inp, out):
             self._emit_fwd("hook_embed", out)
-
         self._persist_handles.append(emb.register_forward_hook(_embed_fwd))
 
-        # layers
+        # safety checks
         if not hasattr(model, "model") or not hasattr(model.model, "layers"):
             raise RuntimeError("Expected Olmo2Model at .model with .layers ModuleList")
         layers: nn.ModuleList = model.model.layers
         if not isinstance(layers, nn.ModuleList):
             raise RuntimeError("Expected model.model.layers to be an nn.ModuleList")
 
-        n_layers = self.cfg.n_layers
-        n_heads = self.cfg.n_heads
-        d_model = self.cfg.d_model
+        n_layers = int(self.cfg.n_layers)
+        n_heads = int(self.cfg.n_heads)
+        d_model = int(self.cfg.d_model)
         d_head = d_model // n_heads
         last_idx = n_layers - 1
 
@@ -161,54 +160,67 @@ class HFHookedOLMo:
                 raise RuntimeError(f"Layer {li} has no .self_attn")
             attn = block.self_attn
 
+            # 1) attn input (residual stream), gradient source for EAP
             def _attn_pre(mod, args, kwargs, _li=li):
-                # input hidden states may come as positional or kwarg
-                x = None
-                if isinstance(args, tuple) and len(args) > 0:
-                    x = args[0]
-                elif isinstance(kwargs, dict):
-                    x = kwargs.get("hidden_states", None)
+                x = args[0] if (isinstance(args, tuple) and args) else kwargs.get("hidden_states", None)
                 if x is None:
                     return
                 name = f"blocks.{_li}.hook_attn_in"
                 self._emit_fwd(name, x)
                 self._attach_bwd(name, x)
-
             self._persist_handles.append(self._register_pre_hook(attn, _attn_pre, with_kwargs=True))
 
-            # attn.hook_result via o_proj input
+            # 2) attn.hook_result: per-head result in residual space, WRITABLE
             if not hasattr(attn, "o_proj"):
                 raise RuntimeError(f"Layer {li} self_attn has no .o_proj")
-            o_proj = attn.o_proj
+            o_proj = attn.o_proj  # nn.Linear(d_model, d_model, bias=False)
 
-            def _o_proj_pre(mod, inputs, _kw, _li=li, _n_heads=n_heads, _d_head=d_head):
-                x = inputs[0] if isinstance(inputs, tuple) and len(inputs) > 0 else None
-                if x is None:
-                    return
-                if x.dim() == 3 and x.size(-1) == _n_heads * _d_head:
-                    x4 = x.view(x.size(0), x.size(1), _n_heads, _d_head)
-                    # Emit and allow in-place modification by listeners
-                    self._emit_fwd(f"blocks.{_li}.attn.hook_result", x4)
-                    # Re-flatten potentially modified view and pass it to module
-                    x_mod = x4.view_as(x)
-                    return (x_mod,), _kw
-                else:
-                    self._emit_fwd(f"blocks.{_li}.attn.hook_result", x)
-                    return inputs, _kw
+            def _o_proj_fwd(mod, inputs, out, _li=li, _H=n_heads, _Dh=d_head, _D=d_model):
+                # inputs[0]: concat heads [B,P,D], out: projected residual [B,P,D]
+                x = inputs[0] if isinstance(inputs, tuple) and inputs else None
+                if x is None or x.dim() != 3 or x.size(-1) != _H * _Dh:
+                    # Emit combined result for listeners; no per-head decomposition possible
+                    self._emit_fwd(f"blocks.{_li}.attn.hook_result", out.unsqueeze(2).expand(-1, -1, _H, -1))
+                    return out
 
-            self._persist_handles.append(self._register_pre_hook(o_proj, _o_proj_pre, with_kwargs=True))
+                # per-head pre-proj
+                x_h = x.view(x.size(0), x.size(1), _H, _Dh)  # [B,P,H,Dh]
+                # slice W_O into per-head blocks: weight [D_out, D_in] = [D, D]
+                W = mod.weight  # [D, D]
+                W_h = W[:, :_H * _Dh].view(_D, _H, _Dh)      # [D, H, Dh]
+                # per-head residual contributions: [B,P,H,D]
+                head_res = torch.einsum("bphd,Dhd->bphD", x_h, W_h)
 
-            # mlp in/out (handle kwargs just in case)
+                name = f"blocks.{_li}.attn.hook_result"
+                # Apply any user forward hooks (e.g., ablation) IN-LINE and capture modifications
+                t = head_res
+                for fn in self._active_fwd.get(name, []):
+                    try:
+                        maybe = fn(t, None)
+                    except TypeError:
+                        maybe = fn(t)
+                    if maybe is not None:
+                        t = maybe
+                self._emit_fwd(name, t)
+
+                # If hooks zeroed some heads, remove their contribution from out
+                # Detect "zeroed" by checking last-dim norm
+                zero_mask = (t.abs().sum(dim=-1) == 0)  # [B,P,H]
+                if zero_mask.any():
+                    removed = head_res.masked_fill(~zero_mask.unsqueeze(-1), 0.0).sum(dim=2)  # [B,P,D]
+                    out = out - removed
+
+                return out
+
+            self._persist_handles.append(o_proj.register_forward_hook(_o_proj_fwd))
+
+            # 3) MLP in/out (residual space). hook_mlp_in is read-only for grads; hook_mlp_out is WRITABLE.
             if not hasattr(block, "mlp"):
                 raise RuntimeError(f"Layer {li} has no .mlp")
             mlp = block.mlp
 
             def _mlp_pre(mod, args, kwargs, _li=li):
-                x = None
-                if isinstance(args, tuple) and len(args) > 0:
-                    x = args[0]
-                elif isinstance(kwargs, dict):
-                    x = kwargs.get("hidden_states", None)
+                x = args[0] if (isinstance(args, tuple) and args) else kwargs.get("hidden_states", None)
                 if x is None:
                     return
                 name = f"blocks.{_li}.hook_mlp_in"
@@ -216,13 +228,22 @@ class HFHookedOLMo:
                 self._attach_bwd(name, x)
 
             def _mlp_fwd(mod, inputs, out, _li=li):
-                # Emit and allow in-place modification by listeners; return out
-                self._emit_fwd(f"blocks.{_li}.hook_mlp_out", out)
-                return out
+                name = f"blocks.{_li}.hook_mlp_out"
+                t = out
+                for fn in self._active_fwd.get(name, []):
+                    try:
+                        maybe = fn(t, None)
+                    except TypeError:
+                        maybe = fn(t)
+                    if maybe is not None:
+                        t = maybe
+                self._emit_fwd(name, t)
+                return t
 
             self._persist_handles.append(self._register_pre_hook(mlp, _mlp_pre, with_kwargs=True))
             self._persist_handles.append(mlp.register_forward_hook(_mlp_fwd))
 
+            # 4) last-layer resid for logits gradients
             if li == last_idx:
                 def _block_fwd(mod, inputs, out, _li=li):
                     name = f"blocks.{_li}.hook_resid_post"

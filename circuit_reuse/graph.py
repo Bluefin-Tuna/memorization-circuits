@@ -1,5 +1,4 @@
-"""This implementation is adapted from existing work on Edge Attribution
-Patching.
+"""This implementation is taken from existing work on Edge Attribution Patching.
 @inproceedings{
     syed2023attribution,
     title={Attribution Patching Outperforms Automated Circuit Discovery},
@@ -13,7 +12,6 @@ Patching.
 from __future__ import annotations
 from typing import Callable, List, Union, Optional, Literal, Dict, Set, Tuple
 from functools import partial
-import gc
 import torch
 from torch import Tensor
 from transformer_lens import HookedTransformer
