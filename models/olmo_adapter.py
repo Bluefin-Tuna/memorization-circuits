@@ -6,6 +6,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sympy import li
 import torch
+try:
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)
+except Exception:
+    pass
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -176,11 +182,15 @@ class HFHookedOLMo:
             o_proj = attn.o_proj  # nn.Linear(d_model, d_model, bias=False)
 
             def _o_proj_fwd(mod, inputs, out, _li=li, _H=n_heads, _Dh=d_head, _D=d_model):
-                # inputs[0]: concat heads [B,P,D], out: projected residual [B,P,D]
+                name = f"blocks.{_li}.attn.hook_result"
+                # Fast path: no listeners -> don’t materialize per-head tensor
+                if not self._active_fwd.get(name):
+                    self._emit_fwd(name, out.unsqueeze(2).expand(-1, -1, _H, -1))
+                    return out
+                # Existing slow path only if needed
                 x = inputs[0] if isinstance(inputs, tuple) and inputs else None
                 if x is None or x.dim() != 3 or x.size(-1) != _H * _Dh:
-                    # Emit combined result for listeners; no per-head decomposition possible
-                    self._emit_fwd(f"blocks.{_li}.attn.hook_result", out.unsqueeze(2).expand(-1, -1, _H, -1))
+                    self._emit_fwd(name, out.unsqueeze(2).expand(-1, -1, _H, -1))
                     return out
 
                 # per-head pre-proj

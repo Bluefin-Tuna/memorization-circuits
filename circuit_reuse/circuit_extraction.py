@@ -25,10 +25,6 @@ class Component:
         return f"{self.kind}[layer={self.layer}, index={self.index}]"
 
 
-def _component_key(c: Component) -> Tuple[int, str, int]:
-    return (c.layer, c.kind, c.index)
-
-
 class CircuitExtractor:
     """
     Extract per-example attribution scores for components.
@@ -120,91 +116,118 @@ class CircuitExtractor:
     def extract_circuits_from_examples(
         self, examples: List[Example], task_name: str, amp: bool, device: str
     ) -> Tuple[List[Set[Component]], List[Dict[Component, float]]]:
-        """
-        Returns:
-          - per-example circuit sets (possibly truncated to self.top_k if set)
-          - per-example full score dicts {Component -> score} (no truncation)
-        """
-        autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16) if amp and device.startswith("cuda") else nullcontext())
+        autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                        if amp and device.startswith("cuda") else nullcontext())
 
         circuits: List[Set[Component]] = []
         per_example_scores: List[Dict[Component, float]] = []
 
-        if self.method == "gradient":
-            max_seq_len = 0
-            all_tokenized = [self._prepare_gradient_inputs(ex) for ex in examples]
-            for clean_tokens, _, _ in all_tokenized:
-                max_seq_len = max(max_seq_len, clean_tokens.shape[1])
+        # Pass 1: CPU-only length scan to size the reusable buffer
+        def _len_cp(t: torch.Tensor) -> int: return int(t.shape[1])
+        max_seq_len = 0
+        for ex in examples:
+            # to_tokens returns CPU tensors here; do NOT .to(device) yet
+            prompt_tok = self.model.to_tokens(ex.prompt, prepend_bos=True)
+            clean_tok = self.model.to_tokens(ex.prompt + ex.target, prepend_bos=True)
+            if self.method == "eap":
+                corrupt_tok = self.model.to_tokens(ex.corrupted_prompt + ex.corrupted_target, prepend_bos=True)
+                max_seq_len = max(max_seq_len, _len_cp(clean_tok), _len_cp(corrupt_tok))
+            else:
+                max_seq_len = max(max_seq_len, _len_cp(clean_tok))
 
-            activations_buffer = torch.zeros(
-                (1, max_seq_len, self.graph.n_forward, self.model.cfg.d_model),
-                device=self.model.cfg.device, dtype=self.model.cfg.dtype,
-            )
+        # One big reusable buffer sized to the real max
+        work_buf = torch.zeros(
+            (1, max_seq_len, self.graph.n_forward, self.model.cfg.d_model),
+            device=self.model.cfg.device, dtype=self.model.cfg.dtype,
+        )
 
-            for idx, (clean_tokens, metric, seq_len) in enumerate(all_tokenized):
-                with autocast_ctx:
-                    scores = torch.zeros((self.graph.n_forward, self.graph.n_backward), device=self.model.cfg.device, dtype=self.model.cfg.dtype)
-                    activations_buffer.zero_()
+        # Pass 2: stream examples to GPU one by one
+        for idx, ex in enumerate(examples):
+            if self.method == "eap":
+                # CPU tokenization
+                prompt_tok = self.model.to_tokens(ex.prompt, prepend_bos=True)
+                clean_full = self.model.to_tokens(ex.prompt + ex.target, prepend_bos=True)
+                corrupted_full = self.model.to_tokens(ex.corrupted_prompt + ex.corrupted_target, prepend_bos=True)
 
-                    _, fwd_hooks_clean, bwd_hooks = make_hooks(self.model, self.graph, activations_buffer, scores)
+                # gold ids and positions (CPU)
+                p_ids, f_ids = prompt_tok.tolist()[0], clean_full.tolist()[0]
+                lcp = 0
+                for a, b in zip(p_ids, f_ids):
+                    if a == b: lcp += 1
+                    else: break
+                gold_ids_list = f_ids[lcp:] if lcp < len(f_ids) else self.model.to_tokens(ex.target, prepend_bos=False).tolist()[0]
+                prompt_len = prompt_tok.shape[1]
+                pos_cpu = torch.arange(prompt_len - 1, prompt_len - 1 + len(gold_ids_list), dtype=torch.long)
 
-                    with self.model.hooks(fwd_hooks=fwd_hooks_clean, bwd_hooks=bwd_hooks):
-                        logits = self.model(clean_tokens)
-                        metric_value = metric(logits, None, None, None)
-                        metric_value.backward()
+                # pad per-example on CPU
+                pad_id = self.model.tokenizer.pad_token_id if self.model.tokenizer.pad_token_id is not None else self.model.tokenizer.eos_token_id
+                ex_len = max(clean_full.shape[1], corrupted_full.shape[1])
+                clean_pad = F.pad(clean_full, (0, ex_len - clean_full.shape[1]), "constant", pad_id)
+                corrupt_pad = F.pad(corrupted_full, (0, ex_len - corrupted_full.shape[1]), "constant", pad_id)
 
-                    self.model.zero_grad(set_to_none=True)
-                    self.model.reset_hooks()
+                # now move only this example to GPU
+                clean_tokens = clean_pad.to(device)
+                corrupted_tokens = corrupt_pad.to(device)
+                positions = pos_cpu.to(device)
+                target_ids = torch.tensor(gold_ids_list, device=device, dtype=torch.long)
+                metric = self._get_metric_fn(positions=positions, target_ids=target_ids)
 
-                component_scores = self._scores_to_components(scores.cpu())
-                per_example_scores.append(component_scores)
-                items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
-                comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
-                circuits.append(comp_set)
-
-                if (idx + 1) % 10 == 0 or (idx + 1) == len(examples):
-                    print(f"[{task_name}] ({self.method}) {idx + 1}/{len(examples)} examples processed (last circuit size={len(comp_set)})")
-
-            del activations_buffer
-            gc.collect()
-            torch.cuda.empty_cache()
-            return circuits, per_example_scores
-
-        elif self.method == "eap":
-            max_seq_len = 0
-            all_tokenized = [self._prepare_eap_inputs(ex) for ex in examples]
-            for clean_tokens, corrupted_tokens, _, _ in all_tokenized:
-                max_seq_len = max(max_seq_len, clean_tokens.shape[1], corrupted_tokens.shape[1])
-
-            activation_difference = torch.zeros(
-                (1, max_seq_len, self.graph.n_forward, self.model.cfg.d_model),
-                device=self.model.cfg.device, dtype=self.model.cfg.dtype,
-            )
-
-            for idx, (clean_tokens, corrupted_tokens, metric, seq_len) in enumerate(all_tokenized):
                 with autocast_ctx:
                     scores = attribute_single_example(
                         model=self.model, graph=self.graph, metric=metric,
                         clean_tokens=clean_tokens, corrupted_tokens=corrupted_tokens,
-                        activation_difference=activation_difference,
+                        activation_difference=work_buf,
                     )
 
-                component_scores = self._scores_to_components(scores)
-                per_example_scores.append(component_scores)
-                items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
-                comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
-                circuits.append(comp_set)
+            else:  # gradient method
+                clean_full = self.model.to_tokens(ex.prompt + ex.target, prepend_bos=True)
+                prompt_tok = self.model.to_tokens(ex.prompt, prepend_bos=True)
 
-                if (idx + 1) % 10 == 0 or (idx + 1) == len(all_tokenized):
-                    print(f"[{task_name}] ({self.method}) {idx + 1}/{len(all_tokenized)} train examples processed (last circuit size={len(comp_set)})")
+                p_ids, f_ids = prompt_tok.tolist()[0], clean_full.tolist()[0]
+                lcp = 0
+                for a, b in zip(p_ids, f_ids):
+                    if a == b: lcp += 1
+                    else: break
+                gold_ids_list = f_ids[lcp:] if lcp < len(f_ids) else self.model.to_tokens(ex.target, prepend_bos=False).tolist()[0]
+                prompt_len = prompt_tok.shape[1]
+                positions = torch.arange(prompt_len - 1, prompt_len - 1 + len(gold_ids_list), dtype=torch.long)
+                target_ids = torch.tensor(gold_ids_list, dtype=torch.long)
 
-            del activation_difference
-            gc.collect()
+                # per-example reusable tensors on GPU
+                seq_len = int(clean_full.shape[1])
+                scores = torch.zeros((self.graph.n_forward, self.graph.n_backward),
+                                    device=self.model.cfg.device, dtype=self.model.cfg.dtype)
+                work_buf.zero_()
+
+                with autocast_ctx:
+                    # Build hooks for this example
+                    _, fwd_hooks_clean, bwd_hooks = make_hooks(self.model, self.graph, work_buf, scores)
+                    metric = self._get_metric_fn(positions=positions.to(device), target_ids=target_ids.to(device))
+                    with self.model.hooks(fwd_hooks=fwd_hooks_clean, bwd_hooks=bwd_hooks):
+                        logits = self.model(clean_full.to(device))
+                        metric(logits, None, None, None).backward()
+                    self.model.zero_grad(set_to_none=True)
+                    self.model.reset_hooks()
+                    scores = scores.cpu()
+
+            # convert to components on CPU
+            component_scores = self._scores_to_components(scores)
+            per_example_scores.append(component_scores)
+            items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
+            comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
+            circuits.append(comp_set)
+
+            if (idx + 1) % 10 == 0 or (idx + 1) == len(examples):
+                print(f"[{task_name}] ({self.method}) {idx + 1}/{len(examples)} examples processed (last circuit size={len(comp_set)})")
+
+            # free per-example tensors
+            del clean_tokens, corrupted_tokens, positions, target_ids, scores
             torch.cuda.empty_cache()
-            return circuits, per_example_scores
 
-        else:
-            raise ValueError(f"Unsupported method: {self.method}")
+        del work_buf
+        gc.collect()
+        torch.cuda.empty_cache()
+        return circuits, per_example_scores
 
 
 def compute_shared_circuit(circuits: List[Set[Component]]) -> Set[Component]:

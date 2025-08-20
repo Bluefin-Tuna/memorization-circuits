@@ -105,7 +105,7 @@ def evaluate_accuracy(model: Any, dataset: Iterable[Example], task: str, verbose
     model.eval()
     correct, total = 0, 0
     device = model.cfg.device
-    with torch.no_grad():
+    with torch.inference_mode():
         for ex in dataset:
             prompt, target = ex.prompt, ex.target
             logits = model(model.to_tokens(prompt, prepend_bos=True).to(device))
@@ -149,7 +149,7 @@ def evaluate_accuracy_with_ablation(
 
     correct, total = 0, 0
     device = model.cfg.device
-    with torch.no_grad(), model.hooks(hooks):
+    with torch.inference_mode(), model.hooks(hooks):
         for ex in dataset:
             prompt, target = ex.prompt, ex.target
             logits = model(model.to_tokens(prompt, prepend_bos=True).to(device))
@@ -209,7 +209,7 @@ def evaluate_predictions(
     ctx = model.hooks(fwd_hooks=hooks) if hooks else nullcontext()
 
     with ctx:
-        with torch.no_grad():
+        with torch.inference_mode():
             for ex in dataset:
                 logits = model(model.to_tokens(ex.prompt, prepend_bos=True).to(device))
                 logits_last = logits[0, -1]

@@ -45,6 +45,6 @@ htmlcov/
 *.bak
 *.tmp
 
-# Ignore data and results folders if present
 data/
 results*/
+scratch/
