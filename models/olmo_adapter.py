@@ -260,9 +260,11 @@ def load_model_any(
 ):
     try:
         from transformer_lens import HookedTransformer
+        print(f"[INFO] Loading model '{model_name}' using HookedTransformer...")
         m = HookedTransformer.from_pretrained(
             model_name, trust_remote_code=True, torch_dtype=torch_dtype
         ).to(device).eval()
         return m
     except Exception:
+        print(f"[INFO] Failed to load with HookedTransformer, trying HFHookedOLMo...")
         return HFHookedOLMo(model_name, device=device, torch_dtype=torch_dtype, revision=revision)
