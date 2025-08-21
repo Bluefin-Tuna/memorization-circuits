@@ -11,9 +11,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy import stats
-from tqdm import tqdm
-from matplotlib.ticker import ScalarFormatter
 
 from circuit_reuse.dataset import (
     get_task_display_name,
@@ -23,11 +20,8 @@ from circuit_reuse.dataset import (
 METHOD_DISPLAY = {"eap": "EAP", "gradient": "Gradient"}
 
 def _extract_step_from_revision(rev: str) -> str | None:
-    # Matches '...-step123-...' or 'step123' etc.
-    m = re.search(r"(?:^|[-_])step(\d+)(?:$|[-_])", rev)
-    if m:
-        return f"step{m.group(1)}"
-    return None
+    m = re.search(r"(?:^|[-_])step(\d+)(?:$|[-_])", str(rev) if rev is not None else "")
+    return f"step{m.group(1)}" if m else None
 
 def _model_display_with_revision(row: pd.Series) -> str:
     base = get_model_display_name(row.get("model_name"))
@@ -37,29 +31,26 @@ def _model_display_with_revision(row: pd.Series) -> str:
     step = _extract_step_from_revision(str(rev))
     return f"{base} {step}" if step else base
 
-
 def safe_filename(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))
     s = re.sub(r"_+", "_", s)
     return s.strip("_.")
 
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Plots for circuit identifiability experiments.")
-    p.add_argument("--results-dir", type=str, default="results", help="Dir with per-run subdirs containing metrics.json.")
-    p.add_argument("--output-dir", type=str, default=None, help="Where to write plots (default: <results-dir>/plots_<ts>).")
-    p.add_argument("--save-csv-name", type=str, default="aggregated_metrics.csv", help="CSV filename inside output dir.")
-    p.add_argument("--show", action="store_true", help="Show plots interactively.")
-    p.add_argument("--percent", action="store_true", default=True, help="Show accuracies in percent.")
-    p.add_argument("--ci", type=float, default=-1, help="Confidence level for CI bars. -1 disables.")
+    p = argparse.ArgumentParser(description="Pretty multiplots for circuit identifiability experiments.")
+    p.add_argument("--results-dir", type=str, default="results")
+    p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument("--save-csv-name", type=str, default="aggregated_metrics.csv")
+    p.add_argument("--show", action="store_true")
+    p.add_argument("--percent", action="store_true", default=True)
+    p.add_argument("--ci", type=float, default=-1)
+    p.add_argument("--reuse-threshold", type=int, default=100, help="For v2 metrics: pick threshold p to plot.")
     return p.parse_args()
-
 
 def discover_metrics(results_dir: Path) -> List[Path]:
     if not results_dir.exists():
         return []
     return sorted(results_dir.rglob("metrics.json"))
-
 
 def load_metrics_json(path: Path) -> Dict[str, Any]:
     try:
@@ -69,173 +60,227 @@ def load_metrics_json(path: Path) -> Dict[str, Any]:
         print(f"[WARN] Failed to load {path}: {e}")
         return {}
 
+def _expand_v2(r: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten metrics.json v2 into rows per (top_k, reuse_threshold)."""
+    rows: List[Dict[str, Any]] = []
+    base = {
+        "version": r.get("version", 1),
+        "model_name": r.get("model_name"),
+        "hf_revision": r.get("hf_revision"),
+        "task": r.get("task"),
+        "method": r.get("method"),
+        "num_examples": r.get("num_examples"),
+        # baseline at top-level
+        "baseline_train_accuracy": r.get("baseline_train_accuracy"),
+        "baseline_val_accuracy": r.get("baseline_val_accuracy"),
+    }
+    by_k = (r.get("by_k") or {})
+    for k_str, block in by_k.items():
+        try:
+            K = int(k_str)
+        except Exception:
+            continue
+        thresholds = (block.get("thresholds") or {})
+        for p_str, tblock in thresholds.items():
+            try:
+                P = int(p_str)
+            except Exception:
+                continue
+            tr = (tblock.get("train") or {})
+            va = (tblock.get("val") or {})
+            row = dict(base)
+            row.update({
+                "top_k": K,
+                "reuse_threshold": P,
+                # accuracies to drive accuracy-vs-k
+                "ablation_train_accuracy": tr.get("ablation_accuracy"),
+                "control_train_accuracy": tr.get("control_accuracy"),
+                "ablation_val_accuracy": va.get("ablation_accuracy"),
+                "control_val_accuracy": va.get("control_accuracy"),
+                # lift (knockout diff)
+                "knockout_diff_train": tr.get("knockout_diff"),
+                "knockout_diff_val": va.get("knockout_diff"),
+            })
+            rows.append(row)
+    return rows
 
 def aggregate(paths: List[Path]) -> pd.DataFrame:
-    rows = [d for p in paths if (d := load_metrics_json(p))]
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
-
+    expanded: List[Dict[str, Any]] = []
+    for p in paths:
+        r = load_metrics_json(p)
+        if not r:
+            continue
+        if int(r.get("version", 1)) >= 2 and "by_k" in r:
+            expanded.extend(_expand_v2(r))
+        else:
+            # v1-style: keep as-is (expects *_correct/*_total columns if present)
+            expanded.append(r)
+    return pd.DataFrame(expanded) if expanded else pd.DataFrame()
 
 def to_display_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
-    df["task_display"] = df["task"].apply(get_task_display_name)
-    df["model_display"] = df.apply(_model_display_with_revision, axis=1)
-    df["method_display"] = df.get("method", pd.Series(dtype=str)).map(METHOD_DISPLAY).fillna(df.get("method", pd.Series(dtype=str)).str.title())
+    if "task" in df.columns:
+        df["task_display"] = df["task"].apply(get_task_display_name)
+    if {"model_name", "hf_revision"}.issubset(df.columns):
+        df["model_display"] = df.apply(_model_display_with_revision, axis=1)
+    else:
+        df["model_display"] = df.get("model_name", pd.Series(dtype=str)).map(get_model_display_name)
+    df["method_display"] = df.get("method", pd.Series(dtype=str)).map(METHOD_DISPLAY).fillna(
+        df.get("method", pd.Series(dtype=str)).str.title()
+    )
     return df
 
+def _setup_style():
+    sns.set_theme(style="ticks", context="talk", palette="colorblind")
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "axes.titlesize": 14,
+        "axes.labelsize": 12,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "figure.dpi": 120,
+    })
 
-def compute_ci(p: np.ndarray, n: np.ndarray, z: float) -> np.ndarray:
-    with np.errstate(divide="ignore", invalid="ignore"):
-        err = z * np.sqrt(np.clip(p, 0, 1) * np.clip(1 - p, 0, 1) / np.where(n <= 0, np.nan, n))
-    return np.nan_to_num(err)
+def _calc_acc(long_df: pd.DataFrame, split: str) -> pd.DataFrame:
+    """
+    Return tidy accuracy vs K with columns:
+    task_display, model_display, method_display, top_k, condition, accuracy.
+    Supports v1 (counts) and v2 (accuracies).
+    """
+    # v2 path: *_accuracy columns exist
+    acc_cols = {f"baseline_{split}_accuracy", f"ablation_{split}_accuracy", f"control_{split}_accuracy"}
+    if acc_cols.issubset(long_df.columns):
+        g = long_df.groupby(["task_display", "model_display", "method_display", "top_k"], as_index=False).mean(numeric_only=True)
+        tidy = pd.DataFrame({
+            "task_display": np.repeat(g["task_display"].values, 3),
+            "model_display": np.repeat(g["model_display"].values, 3),
+            "method_display": np.repeat(g["method_display"].values, 3),
+            "top_k": np.repeat(g["top_k"].values, 3),
+            "condition": np.tile(["Baseline", "Ablated (shared)", "Control (random)"], len(g)),
+            "accuracy": np.concatenate([
+                g[f"baseline_{split}_accuracy"].values,
+                g[f"ablation_{split}_accuracy"].values,
+                g[f"control_{split}_accuracy"].values,
+            ]),
+        })
+        return tidy.replace([np.inf, -np.inf], np.nan).dropna(subset=["accuracy"])
 
-def _get_figsize(n_tasks: int, aspect: float = 3 / 4) -> tuple[float, float]:
-    width = max(10.0, 0.9 * n_tasks + 3.0)
-    height = max(6.0, min(12.0, width * aspect))
-    return (width, height)
+    # v1 path: *_correct/*_total columns exist
+    need = {
+        f"baseline_{split}_correct", f"baseline_{split}_total",
+        f"ablation_{split}_correct", f"ablation_{split}_total",
+        f"control_{split}_correct", f"control_{split}_total",
+    }
+    if need.issubset(set(long_df.columns)):
+        g = (
+            long_df.groupby(["task_display", "model_display", "method_display", "top_k"], as_index=False)
+            .agg({c: "sum" for c in need})
+        )
+        def ratio(c_key, t_key):
+            return g[c_key] / g[t_key].replace(0, np.nan)
+        tidy = pd.DataFrame({
+            "task_display": np.repeat(g["task_display"].values, 3),
+            "model_display": np.repeat(g["model_display"].values, 3),
+            "method_display": np.repeat(g["method_display"].values, 3),
+            "top_k": np.repeat(g["top_k"].values, 3),
+            "condition": np.tile(["Baseline", "Ablated (shared)", "Control (random)"], len(g)),
+            "accuracy": np.concatenate([
+                ratio(f"baseline_{split}_correct", f"baseline_{split}_total").values,
+                ratio(f"ablation_{split}_correct", f"ablation_{split}_total").values,
+                ratio(f"control_{split}_correct", f"control_{split}_total").values,
+            ]),
+        })
+        return tidy.replace([np.inf, -np.inf], np.nan).dropna(subset=["accuracy"])
 
-def plot_accuracy_bars(df: pd.DataFrame, out_dir: Path, split: str = "train", percent: bool = True, ci_level: float = -1.0, show: bool = False):
-    if df.empty:
+    return pd.DataFrame()
+
+def _save_or_show(fig, path: Path, show: bool):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+def _maybe_filter_by_threshold(df: pd.DataFrame, p: int) -> pd.DataFrame:
+    if "reuse_threshold" in df.columns:
+        return df[df["reuse_threshold"] == p].copy()
+    return df
+
+def plot_accuracy_vs_k_by_task(df: pd.DataFrame, out_dir: Path, split: str = "train",
+                               percent: bool = True, show: bool = False, p: int | None = None):
+    if p is not None:
+        df = _maybe_filter_by_threshold(df, p)
+    tidy = _calc_acc(df, split)
+    if tidy.empty:
+        print(f"[INFO] Missing accuracy columns for split={split}. Skipping.")
         return
-    cols_needed = {f"baseline_{split}_correct", f"baseline_{split}_total", f"ablation_{split}_correct", f"ablation_{split}_total", f"control_{split}_correct", f"control_{split}_total"}
-    if not cols_needed.issubset(set(df.columns)):
-        print(f"[INFO] Missing accuracy cols for split={split}; skipping bars.")
-        return
+    if percent:
+        tidy = tidy.assign(accuracy=tidy["accuracy"] * 100.0)
 
-    grouped = (
-        df.groupby(["model_display", "task_display", "method_display", "top_k"], as_index=False)
-        .agg(**{c: (c, "sum") for c in cols_needed})
-    )
+    suffix = f"_p{p}" if p is not None else ""
+    for method, sub_m in tidy.groupby("method_display"):
+        for task, sub in sub_m.groupby("task_display"):
+            fig, ax = plt.subplots(figsize=(9, 5))
+            sns.lineplot(
+                data=sub.sort_values("top_k"),
+                x="top_k",
+                y="accuracy",
+                hue="model_display",
+                style="condition",
+                markers=True,
+                dashes=False,
+                ax=ax,
+            )
+            ax.grid(True, axis="y", linestyle="--", alpha=0.5)
+            ax.set_xlabel("top-k")
+            ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
+            title = f"{task} — {method} — {split}"
+            if p is not None:
+                title += f" — p={p}"
+            ax.set_title(title)
+            ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+            outp = out_dir / "by_task" / safe_filename(task) / f"{safe_filename(method)}_{split}_accuracy_vs_k{suffix}.png"
+            _save_or_show(fig, outp, show)
 
-    scale = 100 if percent else 1
-    z = stats.norm.ppf((1 + ci_level) / 2) if ci_level != -1 else None
-
-    for (model_disp, method_disp, k_val), sub in tqdm(grouped.groupby(["model_display", "method_display", "top_k"], as_index=False), desc="Plotting accuracy bars"):
-        safe_model = safe_filename(model_disp)
-        safe_method = safe_filename(str(method_disp).lower())
-        safe_k = int(k_val)
-        sub = sub.sort_values("task_display")
-        base_p = sub[f"baseline_{split}_correct"] / sub[f"baseline_{split}_total"].replace(0, np.nan)
-        abl_p = sub[f"ablation_{split}_correct"] / sub[f"ablation_{split}_total"].replace(0, np.nan)
-        ctrl_p = sub[f"control_{split}_correct"] / sub[f"control_{split}_total"].replace(0, np.nan)
-
-        base_e = compute_ci(base_p.values, sub[f"baseline_{split}_total"].values, z) if z is not None else np.zeros_like(base_p.values)
-        abl_e = compute_ci(abl_p.values, sub[f"ablation_{split}_total"].values, z) if z is not None else np.zeros_like(abl_p.values)
-        ctrl_e = compute_ci(ctrl_p.values, sub[f"control_{split}_total"].values, z) if z is not None else np.zeros_like(ctrl_p.values)
-
-        tasks = list(sub["task_display"].values)
-        x = np.arange(len(tasks))
-        width = 0.25
-
-        fig, ax = plt.subplots(figsize=_get_figsize(len(tasks)))
-        b1 = ax.bar(x - width, base_p.values * scale, width, label="Baseline", yerr=base_e * scale if z is not None else None, capsize=3)
-        b2 = ax.bar(x, abl_p.values * scale, width, label="Ablated (shared)", yerr=abl_e * scale if z is not None else None, capsize=3)
-        b3 = ax.bar(x + width, ctrl_p.values * scale, width, label="Control (random)", yerr=ctrl_e * scale if z is not None else None, capsize=3)
-
-        for bars in [b1, b2, b3]:
-            for r in bars:
-                h = r.get_height()
-                if np.isfinite(h):
-                    ax.annotate(f"{h:.1f}", (r.get_x() + r.get_width() / 2, h), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=9)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(tasks, rotation=30, ha="right")
-        ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
-        ax.set_title(f"{model_disp} k={safe_k}")
-        ax.grid(axis="y", linestyle="--", alpha=0.6)
-
-        handles, labels = ax.get_legend_handles_labels()
-        fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.06))
-
-        outp = out_dir / f"{safe_model}/{safe_k}/{safe_model}_{safe_method}_k{safe_k}_{split}.png"
-        outp.parent.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
-        fig.savefig(outp, dpi=200, bbox_inches="tight")
-        if show:
-            plt.show()
-        plt.close(fig)
-
-
-def plot_identifiability_vs_k(df: pd.DataFrame, out_dir: Path, show: bool = False):
-    if df.empty or "circuit_identifiability_score" not in df.columns:
-        return
-    gk = (
-        df.groupby(["model_display", "task_display", "method_display", "top_k"], as_index=False)
-        .agg(cis=("circuit_identifiability_score", "mean"))
-        .sort_values("top_k")
-    )
-    for (model_disp, method_disp), sub in tqdm(gk.groupby(["model_display", "method_display"], as_index=False), desc="Plotting identifiability vs k"):
-        safe_model = safe_filename(model_disp)
-        safe_method = safe_filename(str(method_disp).lower())
-        tasks = sorted(sub["task_display"].unique())
-        fig, ax = plt.subplots(figsize=_get_figsize(len(tasks)))
-        cmap = plt.get_cmap("viridis")
-        ks = sorted(sub["top_k"].unique())
-        grads = np.linspace(0.3, 0.9, max(1, len(ks)))
-        for i, k in enumerate(ks):
-            s = sub[sub["top_k"] == k].set_index("task_display").reindex(tasks)
-            ax.plot(np.arange(len(tasks)), s["cis"].values, marker="o", color=cmap(grads[i]), label=f"k={int(k)}")
-        ax.set_xticks(np.arange(len(tasks)))
-        ax.set_xticklabels(tasks, rotation=30, ha="right")
-        ax.set_ylabel("Circuit identifiability score")
-        ax.set_title(f"{model_disp}")
-        ax.grid(axis="y", linestyle="--", alpha=0.6)
-
-        handles, labels = ax.get_legend_handles_labels()
-        fig.legend(handles, labels, loc="lower center", ncol=len(ks), bbox_to_anchor=(0.5, -0.06))
-
-        outp = out_dir / f"{safe_model}/{safe_model}_{safe_method}_cis_vs_k.png"
-        outp.parent.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
-        fig.savefig(outp, dpi=200, bbox_inches="tight")
-        if show:
-            plt.show()
-        plt.close(fig)
-
-
-def plot_knockout_diff_vs_k(df: pd.DataFrame, out_dir: Path, split: str = "train", show: bool = False):
+def plot_knockout_diff_vs_k_by_task(df: pd.DataFrame, out_dir: Path, split: str = "train",
+                                    show: bool = False, p: int | None = None):
     col = f"knockout_diff_{split}"
+    if p is not None:
+        df = _maybe_filter_by_threshold(df, p)
     if df.empty or col not in df.columns:
         return
     gk = (
-        df.groupby(["model_display", "task_display", "method_display", "top_k"], as_index=False)
+        df.groupby(["task_display", "model_display", "method_display", "top_k"], as_index=False)
         .agg(kd=(col, "mean"))
-        .sort_values("top_k")
     )
-    for (model_disp, method_disp), sub in tqdm(gk.groupby(["model_display", "method_display"], as_index=False), desc="Plotting knockout diff vs k"):
-        safe_model = safe_filename(model_disp)
-        safe_method = safe_filename(str(method_disp).lower())
-        tasks = sorted(sub["task_display"].unique())
-        fig, ax = plt.subplots(figsize=_get_figsize(len(tasks)))
-        cmap = plt.get_cmap("viridis")
-        ks = sorted(sub["top_k"].unique())
-        grads = np.linspace(0.3, 0.9, max(1, len(ks)))
-        for i, k in enumerate(ks):
-            s = sub[sub["top_k"] == k].set_index("task_display").reindex(tasks)
-            ax.plot(np.arange(len(tasks)), s["kd"].values, marker="o", color=cmap(grads[i]), label=f"k={int(k)}")
-        ax.axhline(1.0, color="gray", linestyle="--", linewidth=1)
-        ax.set_xticks(np.arange(len(tasks)))
-        ax.set_xticklabels(tasks, rotation=30, ha="right")
-        ax.set_ylabel("Ablation Impact Ratio")
-        ax.set_title(f"{model_disp} {split.title()} (base - shared) / (base - random)")
-        ax.grid(axis="y", linestyle="--", alpha=0.6)
-        ax.ticklabel_format(axis="y", style="plain", useOffset=False, scilimits=(0, 0))
-        ax.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
-        ax.yaxis.get_major_formatter().set_scientific(False)
-        ax.yaxis.get_major_formatter().set_useOffset(False)
-
-        handles, labels = ax.get_legend_handles_labels()
-        fig.legend(handles, labels, loc="lower center", ncol=len(ks), bbox_to_anchor=(0.5, -0.06))
-
-        outp = out_dir / f"{safe_model}/{safe_model}_{safe_method}_knockout_{split}_vs_k.png"
-        outp.parent.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
-        fig.savefig(outp, dpi=200, bbox_inches="tight")
-        if show:
-            plt.show()
-        plt.close(fig)
-
+    suffix = f"_p{p}" if p is not None else ""
+    for method, sub_m in gk.groupby("method_display"):
+        for task, sub in sub_m.groupby("task_display"):
+            fig, ax = plt.subplots(figsize=(9, 5))
+            sns.lineplot(
+                data=sub.sort_values("top_k"),
+                x="top_k",
+                y="kd",
+                hue="model_display",
+                markers=True,
+                dashes=False,
+                ax=ax,
+            )
+            ax.axhline(1.0, color="gray", linestyle="--", linewidth=1)
+            ax.grid(True, axis="y", linestyle="--", alpha=0.5)
+            ax.set_xlabel("top-k")
+            ax.set_ylabel("Ablation Impact Ratio")
+            title = f"{task} — {method} — {split}"
+            if p is not None:
+                title += f" — p={p}"
+            ax.set_title(title)
+            ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+            outp = out_dir / "by_task" / safe_filename(task) / f"{safe_filename(method)}_knockout_{split}_vs_k{suffix}.png"
+            _save_or_show(fig, outp, show)
 
 def main():
     args = parse_args()
@@ -247,8 +292,6 @@ def main():
         return
 
     df = to_display_cols(df)
-
-    percent = not args.percent is False
     out_dir = Path(args.output_dir) if args.output_dir else results_dir / f"plots_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -256,19 +299,27 @@ def main():
     df.to_csv(csv_path, index=False)
     print(f"[INFO] Aggregated CSV saved to {csv_path}")
 
-    sns.set_theme(style="ticks", context="talk", palette="colorblind")
-    plt.rcParams.update({"font.family": "serif"})
+    _setup_style()
 
-    plot_accuracy_bars(df, out_dir, split="train", percent=percent, ci_level=args.ci, show=args.show)
-    if df.get("baseline_val_total", pd.Series([0])).sum() > 0:
-        plot_accuracy_bars(df, out_dir, split="val", percent=percent, ci_level=args.ci, show=args.show)
+    percent = not args.percent is False
+    p = args.reuse_threshold
 
-    # New plots
-    plot_identifiability_vs_k(df, out_dir, show=args.show)
-    plot_knockout_diff_vs_k(df, out_dir, split="train", show=args.show)
-    if df.get("baseline_val_total", pd.Series([0])).sum() > 0:
-        plot_knockout_diff_vs_k(df, out_dir, split="val", show=args.show)
+    # accuracy vs k (v2 ready)
+    plot_accuracy_vs_k_by_task(df, out_dir, split="train", percent=percent, show=args.show, p=p)
+    if df.get("baseline_val_accuracy", pd.Series([np.nan])).notna().any():
+        plot_accuracy_vs_k_by_task(df, out_dir, split="val", percent=percent, show=args.show, p=p)
 
+    # knockout diff vs k (v2 ready)
+    # accept either v1 naming or v2 "knockout_diff_train/val"
+    if "knockout_diff_train" in df.columns and "knockout_diff_val" in df.columns:
+        df = df.rename(columns={"knockout_diff_train": "knockout_diff_train",
+                                "knockout_diff_val": "knockout_diff_val"})
+    plot_knockout_diff_vs_k_by_task(df.rename(columns={
+        "knockout_diff_train": "knockout_diff_train",
+        "knockout_diff_val": "knockout_diff_val"
+    }), out_dir, split="train", show=args.show, p=p)
+    if "knockout_diff_val" in df.columns:
+        plot_knockout_diff_vs_k_by_task(df, out_dir, split="val", show=args.show, p=p)
 
 if __name__ == "__main__":
     main()

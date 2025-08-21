@@ -154,6 +154,41 @@ def _safe_div(a: float, b: float) -> float:
     return float(a / denom)
 
 
+def _sample_control_components(
+    shared: List[Component],
+    all_components: List[Component],
+    rng: random.Random,
+) -> List[Component]:
+    """
+    Sample a control set with the same number of attention heads and MLPs
+    as the shared circuit. Sampling is without replacement within each type.
+    We do not exclude shared components from the sampling pool to keep parity
+    with the prior behavior of sampling from the full set.
+    """
+    if not shared:
+        return []
+
+    # Count how many of each type are in the shared circuit
+    n_shared_heads = sum(1 for c in shared if c.kind == "head")
+    n_shared_mlps = sum(1 for c in shared if c.kind == "mlp")
+
+    # Build pools for heads and mlps
+    head_pool = [c for c in all_components if c.kind == "head"]
+    mlp_pool = [c for c in all_components if c.kind == "mlp"]
+
+    # Guard against impossible requests (shouldn't happen under normal configs)
+    n_heads_to_sample = min(n_shared_heads, len(head_pool))
+    n_mlps_to_sample = min(n_shared_mlps, len(mlp_pool))
+
+    sampled: List[Component] = []
+    if n_heads_to_sample > 0:
+        sampled.extend(rng.sample(head_pool, n_heads_to_sample))
+    if n_mlps_to_sample > 0:
+        sampled.extend(rng.sample(mlp_pool, n_mlps_to_sample))
+
+    return sampled
+
+
 def _run_single_combination(
     model, model_name: str, task: str, num_examples: int, digits: int | None,
     top_k_list: List[int], reuse_thresholds: List[int], device: str, debug: bool, run_dir: Path, amp: bool,
@@ -251,8 +286,7 @@ def _run_single_combination(
             # Evaluate ablations and collect per-example correctness for permutation tests
             rng_seed = int(hashlib.md5(f"{combo_key_root}|K{K}|p{thr}".encode("utf-8")).hexdigest()[:8], 16)
             rng = random.Random(rng_seed)
-            control_size = min(shared_size, len(all_components))
-            control_removed = rng.sample(all_components, control_size) if control_size > 0 else []
+            control_removed = _sample_control_components(shared, all_components, rng) if shared_size > 0 else []
 
             if shared_size > 0:
                 ablation_train_correct, ablation_train_total, ablation_train_preds = evaluate_predictions(
@@ -261,7 +295,7 @@ def _run_single_combination(
             else:
                 ablation_train_correct, ablation_train_total = baseline_train_correct, baseline_train_total
                 ablation_train_preds = [{"is_correct": True}] * len(train_examples)
-            if control_size > 0:
+            if len(control_removed) > 0:
                 control_train_correct, control_train_total, control_train_preds = evaluate_predictions(
                     model, train_examples, task=task, removed=control_removed, verbose=debug
                 )
@@ -280,7 +314,7 @@ def _run_single_combination(
                 else:
                     ablation_val_correct, ablation_val_total = baseline_val_correct, baseline_val_total
                     ablation_val_preds = [{"is_correct": True}] * len(val_examples)
-                if control_size > 0:
+                if len(control_removed) > 0:
                     control_val_correct, control_val_total, control_val_preds = evaluate_predictions(
                         model, val_examples, task=task, removed=control_removed, verbose=debug
                     )
