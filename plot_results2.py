@@ -74,10 +74,10 @@ def aggregate(paths: List[Path]) -> pd.DataFrame:
                     "shared_circuit_size": tblock.get("shared_circuit_size"),
                     "train_knockout_diff": tblock.get("train", {}).get("knockout_diff"),
                     "val_knockout_diff": tblock.get("val", {}).get("knockout_diff"),
-            "perm_train_p": (tblock.get("train", {}).get("permutation", {}) or {}).get("p_value"),
-            "perm_train_obs": (tblock.get("train", {}).get("permutation", {}) or {}).get("obs_diff"),
-            "perm_val_p": (tblock.get("val", {}).get("permutation", {}) or {}).get("p_value"),
-            "perm_val_obs": (tblock.get("val", {}).get("permutation", {}) or {}).get("obs_diff"),
+                    "perm_train_p": (tblock.get("train", {}).get("permutation", {}) or {}).get("p_value"),
+                    "perm_train_obs": (tblock.get("train", {}).get("permutation", {}) or {}).get("obs_diff"),
+                    "perm_val_p": (tblock.get("val", {}).get("permutation", {}) or {}).get("p_value"),
+                    "perm_val_obs": (tblock.get("val", {}).get("permutation", {}) or {}).get("obs_diff"),
                 })
                 expanded.append(row)
     return pd.DataFrame(expanded)
