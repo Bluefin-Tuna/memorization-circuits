@@ -75,7 +75,12 @@ class AttentionNode(Node):
 
     def __init__(self, layer: int, head: int, cfg: Dict):
         self.head = head
-        self.kv_head = head // (cfg["n_heads"] // cfg["n_kv_heads"])
+        # Map attention head index to its corresponding KV head index.
+        # Some models (e.g., GPT-2) have no separate KV heads; treat n_kv_heads == n_heads.
+        n_heads = int(cfg["n_heads"])
+        n_kv = int(cfg.get("n_kv_heads") or n_heads)
+        ratio = max(1, n_heads // max(1, n_kv))
+        self.kv_head = head // ratio
         super().__init__(
             f"a{layer}.h{head}",
             layer,
@@ -149,7 +154,10 @@ class Graph:
     def from_model(cls, model: HookedTransformer) -> "Graph":
         graph = Graph()
         cfg = model.cfg
-        nkv_heads = getattr(cfg, "n_key_value_heads", cfg.n_heads)
+        nkv_heads = getattr(cfg, "n_key_value_heads", None)
+        nkv_heads = int(nkv_heads) if nkv_heads is not None else int(cfg.n_heads)
+        if nkv_heads <= 0:
+            nkv_heads = int(cfg.n_heads)
         graph.cfg = {"n_layers": cfg.n_layers, "n_heads": cfg.n_heads, "n_kv_heads": nkv_heads}
 
         nodes: List[Node] = [InputNode()]

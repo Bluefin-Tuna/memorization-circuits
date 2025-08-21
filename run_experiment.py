@@ -1,6 +1,6 @@
 import argparse
 import time
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Iterable
 import json
 import math
 from pathlib import Path
@@ -15,9 +15,6 @@ from models.olmo_adapter import load_model_any
 from circuit_reuse.dataset import get_dataset, Example
 from circuit_reuse.circuit_extraction import (
     CircuitExtractor,
-    compute_shared_circuit,
-    select_shared_by_proportion,
-    circuit_identifiability_score,
     Component,
 )
 from circuit_reuse.evaluate import (
@@ -47,15 +44,33 @@ def _prepare_run_dir(output_dir: str, run_name: str | None):
     return run_dir
 
 
+def _parse_int_list(s: str | None) -> List[int]:
+    if s is None:
+        return []
+    if isinstance(s, list):  # already parsed
+        return [int(x) for x in s]
+    return [int(x.strip()) for x in str(s).replace(";", ",").split(",") if x is not None and str(x).strip() != ""]
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Circuit reuse experiment (single-run) with identifiability score and saved artifacts.")
+    parser = argparse.ArgumentParser(description="Circuit reuse experiment (single-run) with reuse@p metrics and saved artifacts.")
     parser.add_argument("--model_name", type=str, required=True, help="Model name.")
     parser.add_argument("--hf-revision", type=str, default=None, help="HF revision tag or commit (e.g., some-step-tag).")
     parser.add_argument("--task", type=str, required=True, help="Task name.")
     parser.add_argument("--num_examples", type=int, required=True, help="Number of examples to generate/use.")
     parser.add_argument("--digits", type=int, default=None, help="Digit count (only for addition).")
-    parser.add_argument("--top_k", type=int, required=True, help="Size of the shared circuit K (new semantics).")
-    parser.add_argument("--example_k", type=int, default=0, help="Per-example top-k used to form example circuits. 0 means keep all scored components.")
+    parser.add_argument(
+        "--top_k_list",
+        type=str,
+        required=True,
+        help="Comma-separated list of per-example top-K values to evaluate (e.g., '5,10,25,50').",
+    )
+    parser.add_argument(
+        "--reuse-thresholds",
+        type=str,
+        default="95,96,97,98,99,100",
+        help="Comma-separated list of reuse thresholds p as percentages (e.g., '95,99,100' for reuse@95..).",
+    )
     parser.add_argument("--method", type=str, default="eap", choices=["eap", "gradient"], help="Attribution method.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--debug", action="store_true")
@@ -65,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-mem", action="store_true", help="Print CUDA memory after the run.")
     parser.add_argument("--amp", action="store_true", help="Use autocast (mixed precision) during extraction.")
     parser.add_argument("--val-fraction", type=float, default=0.2, help="Holdout fraction for validation.")
-    parser.add_argument("--perm-trials", type=int, default=5000, help="Permutation test trials for shared vs control.")
+    parser.add_argument("--perm-trials", type=int, default=5000, help="Trials for paired permutation test between shared vs control ablations.")
     return parser.parse_args()
 
 
@@ -118,9 +133,30 @@ def _save_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(r) + "\n")
 
 
+def _build_topk_example_sets(per_example_scores: List[Dict[Component, float]], k: int) -> List[set]:
+    sets: List[set] = []
+    for sc in per_example_scores:
+        ranked = sorted(sc.items(), key=lambda x: x[1], reverse=True)
+        sets.append({c for c, _ in ranked[:k]})
+    return sets
+
+
+def _count_components(example_sets: List[set]) -> Dict[Component, int]:
+    counts: Dict[Component, int] = {}
+    for s in example_sets:
+        for c in s:
+            counts[c] = counts.get(c, 0) + 1
+    return counts
+
+
+def _safe_div(a: float, b: float) -> float:
+    denom = b if abs(b) > 1e-12 else (1e-12 if b >= 0 else -1e-12)
+    return float(a / denom)
+
+
 def _run_single_combination(
     model, model_name: str, task: str, num_examples: int, digits: int | None,
-    k_shared: int, example_k: int, device: str, debug: bool, run_dir: Path, amp: bool,
+    top_k_list: List[int], reuse_thresholds: List[int], device: str, debug: bool, run_dir: Path, amp: bool,
     val_fraction: float, method: str, hf_revision: str | None, perm_trials: int,
 ):
     dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
@@ -139,132 +175,164 @@ def _run_single_combination(
     if debug:
         print(f"[SPLIT] total={n} train={len(train_examples)} val={len(val_examples)} (val_fraction={vf:.2f})")
 
-    # Per-example top-k (example_k) controls the sets used to compute proportions
-    extractor = CircuitExtractor(model, top_k=(None if example_k <= 0 else example_k), method=method)
+    # Compute full per-example attribution scores once (keep all), we will slice to top-K later
+    extractor = CircuitExtractor(model, top_k=None, method=method)
 
-    combo_key = f"{model_name}|{hf_revision or 'none'}|{task}|{method}|n{num_examples}|d{digits}|K{k_shared}|ek{example_k}"
+    combo_key_root = f"{model_name}|{hf_revision or 'none'}|{task}|{method}|n{num_examples}|d{digits}"
     start = time.time()
 
-    example_sets: List[set] = []
+    example_sets_all: List[set] = []
     example_scores: List[Dict[Component, float]] = []
     try:
-        example_sets, example_scores = extractor.extract_circuits_from_examples(
+        example_sets_all, example_scores = extractor.extract_circuits_from_examples(
             examples=train_examples,
             task_name=task,
             amp=amp,
-            device=device
+            device=device,
         )
     except torch.cuda.OutOfMemoryError as e:
-        print(f"[OOM] Skipping attribution for {combo_key}: {e}")
+        print(f"[OOM] Skipping attribution for {combo_key_root}: {e}")
     except Exception as e:
-        print(f"[ERROR] Circuit extraction failed for {combo_key}: {e}")
-
-    # Select top K shared components by proportion and mean score
-    selected_shared, prop_map = select_shared_by_proportion(example_sets, example_scores, k_shared=k_shared)
-    cis = circuit_identifiability_score(prop_map)
+        print(f"[ERROR] Circuit extraction failed for {combo_key_root}: {e}")
     end = time.time()
 
-    # Evaluate baseline and ablations on train/val
+    # Evaluate baseline once
     baseline_train_correct, baseline_train_total = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
-    ablation_train_correct, ablation_train_total = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=selected_shared, verbose=debug)
+    baseline_train_acc = baseline_train_correct / baseline_train_total if baseline_train_total > 0 else 0.0
     if val_examples:
         baseline_val_correct, baseline_val_total = evaluate_accuracy(model, val_examples, task=task, verbose=debug)
-        ablation_val_correct, ablation_val_total = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=selected_shared, verbose=debug)
+        baseline_val_acc = baseline_val_correct / baseline_val_total if baseline_val_total > 0 else float("nan")
     else:
-        baseline_val_correct = baseline_val_total = ablation_val_correct = ablation_val_total = 0
+        baseline_val_correct = baseline_val_total = 0
+        baseline_val_acc = float("nan")
 
-    baseline_train_acc = baseline_train_correct / baseline_train_total if baseline_train_total > 0 else 0.0
-    ablation_train_acc = ablation_train_correct / ablation_train_total if ablation_train_total > 0 else 0.0
-    baseline_val_acc = baseline_val_correct / baseline_val_total if baseline_val_total > 0 else float("nan")
-    ablation_val_acc = ablation_val_correct / ablation_val_total if ablation_val_total > 0 else float("nan")
-
-    # Random control ablation with same size
-    all_components = _enumerate_all_components(model)
-    k = min(len(selected_shared), len(all_components))
-    rng_seed = int(hashlib.md5(combo_key.encode("utf-8")).hexdigest()[:8], 16)
-    rng = random.Random(rng_seed)
-    control_removed = rng.sample(all_components, k) if k > 0 else []
-    print(f"[{task}] Shared K={len(selected_shared)}; Control uses {len(control_removed)}/{len(all_components)} random comps (seed={rng_seed}).")
-
-    control_train_correct, control_train_total = evaluate_accuracy_with_ablation(model, train_examples, task=task, removed=control_removed, verbose=debug)
-    control_train_acc = control_train_correct / control_train_total if control_train_total > 0 else 0.0
-    if val_examples:
-        control_val_correct, control_val_total = evaluate_accuracy_with_ablation(model, val_examples, task=task, removed=control_removed, verbose=debug)
-        control_val_acc = control_val_correct / control_val_total if control_val_total > 0 else 0.0
-    else:
-        control_val_correct = control_val_total = 0
-        control_val_acc = float("nan")
-
-    # Knockout diff: (baseline - shared) / (baseline - control)
-    def _safe_div(a: float, b: float) -> float:
-        denom = b if abs(b) > 1e-12 else (1e-12 if b >= 0 else -1e-12)
-        return float(a / denom)
-
-    knockout_train = _safe_div(baseline_train_acc - ablation_train_acc, baseline_train_acc - control_train_acc)
-    knockout_val = _safe_div(baseline_val_acc - ablation_val_acc, baseline_val_acc - control_val_acc) if not math.isnan(baseline_val_acc) else float("nan")
-
-    # Per-example predictions for permutation test (train split)
-    _, _, preds_shared = evaluate_predictions(model, train_examples, task=task, removed=selected_shared, verbose=debug)
-    _, _, preds_control = evaluate_predictions(model, train_examples, task=task, removed=control_removed, verbose=debug)
-    shared_flags = [int(r["is_correct"]) for r in preds_shared]
-    control_flags = [int(r["is_correct"]) for r in preds_control]
-    perm = _permutation_test(shared_flags, control_flags, trials=perm_trials, rng=random.Random(rng_seed + 1))
-
-    # Save artifacts
-    # 1) metrics.json (summary)
-    metrics = {
+    # Prepare metrics structure
+    metrics: Dict[str, Any] = {
+        "version": 2,
         "model_name": model_name,
         "hf_revision": hf_revision,
         "task": task,
         "num_examples": len(dataset),
         "digits": digits if task == "addition" else None,
         "method": method,
-        "top_k": k_shared,                     # shared K (new semantics)
-        "example_k": (None if example_k <= 0 else example_k),
+        "top_k_list": list(sorted(set(int(k) for k in top_k_list))),
+        "reuse_thresholds": list(sorted(set(int(p) for p in reuse_thresholds))),
         "val_fraction": vf,
+    "perm_trials": int(perm_trials),
         "extraction_seconds": end - start,
-
-        "circuit_identifiability_score": cis,
-        "shared_circuit_size": len(selected_shared),
-        "shared_circuit_components": [str(c) for c in sorted(selected_shared, key=lambda c: (c.layer, c.kind, c.index))],
-        "shared_component_proportions": {str(c): float(p) for c, p in sorted(prop_map.items(), key=lambda x: (x[1], x[0].layer, x[0].kind, x[0].index), reverse=True)},
-
         "baseline_train_accuracy": baseline_train_acc,
         "baseline_train_correct": baseline_train_correct,
         "baseline_train_total": baseline_train_total,
-        "ablation_train_accuracy": ablation_train_acc,
-        "ablation_train_correct": ablation_train_correct,
-        "ablation_train_total": ablation_train_total,
-        "control_train_accuracy": control_train_acc,
-        "control_train_correct": control_train_correct,
-        "control_train_total": control_train_total,
-
         "baseline_val_accuracy": baseline_val_acc,
         "baseline_val_correct": baseline_val_correct,
         "baseline_val_total": baseline_val_total,
-        "ablation_val_accuracy": ablation_val_acc,
-        "ablation_val_correct": ablation_val_correct,
-        "ablation_val_total": ablation_val_total,
-        "control_val_accuracy": control_val_acc,
-        "control_val_correct": control_val_correct,
-        "control_val_total": control_val_total,
-
-        "accuracy_drop_train": baseline_train_acc - ablation_train_acc,
-        "accuracy_drop_val": (baseline_val_acc - ablation_val_acc) if not math.isnan(baseline_val_acc) else float("nan"),
-        "control_accuracy_drop_train": baseline_train_acc - control_train_acc,
-        "control_accuracy_drop_val": (baseline_val_acc - control_val_acc) if not math.isnan(baseline_val_acc) else float("nan"),
-
-        "knockout_diff_train": knockout_train,
-        "knockout_diff_val": knockout_val,
-
-        "control_removed_components": [str(c) for c in sorted(control_removed, key=lambda c: (c.layer, c.kind, c.index))],
-        "control_rng_seed": rng_seed,
-        "control_total_component_count": len(all_components),
-
-        "perm_obs_diff": perm["obs_diff"],
-        "perm_trials": perm["trials"],
-        "perm_p_value": perm["p_value"],
+        "by_k": {},
     }
+
+    all_components = _enumerate_all_components(model)
+
+    # Loop over K and thresholds
+    for K in metrics["top_k_list"]:
+        if K <= 0:
+            continue
+        sets_k = _build_topk_example_sets(example_scores, K)
+        counts = _count_components(sets_k)
+        n_ex = len(sets_k)
+
+        per_thresh: Dict[str, Any] = {}
+        for p in metrics["reuse_thresholds"]:
+            thr = max(0, min(100, int(p)))
+            need = int(math.ceil(thr / 100.0 * n_ex))
+            shared = [c for c, cnt in counts.items() if cnt >= need]
+            shared_size = len(shared)
+            # Reuse percent is capped at 100
+            reuse_percent = float(min(shared_size, K) / max(1, K) * 100.0)
+
+            # Evaluate ablations and collect per-example correctness for permutation tests
+            rng_seed = int(hashlib.md5(f"{combo_key_root}|K{K}|p{thr}".encode("utf-8")).hexdigest()[:8], 16)
+            rng = random.Random(rng_seed)
+            control_size = min(shared_size, len(all_components))
+            control_removed = rng.sample(all_components, control_size) if control_size > 0 else []
+
+            if shared_size > 0:
+                ablation_train_correct, ablation_train_total, ablation_train_preds = evaluate_predictions(
+                    model, train_examples, task=task, removed=shared, verbose=debug
+                )
+            else:
+                ablation_train_correct, ablation_train_total = baseline_train_correct, baseline_train_total
+                ablation_train_preds = [{"is_correct": True}] * len(train_examples)
+            if control_size > 0:
+                control_train_correct, control_train_total, control_train_preds = evaluate_predictions(
+                    model, train_examples, task=task, removed=control_removed, verbose=debug
+                )
+            else:
+                control_train_correct, control_train_total = baseline_train_correct, baseline_train_total
+                control_train_preds = [{"is_correct": True}] * len(train_examples)
+
+            ablation_train_acc = ablation_train_correct / ablation_train_total if ablation_train_total > 0 else 0.0
+            control_train_acc = control_train_correct / control_train_total if control_train_total > 0 else 0.0
+
+            if val_examples:
+                if shared_size > 0:
+                    ablation_val_correct, ablation_val_total, ablation_val_preds = evaluate_predictions(
+                        model, val_examples, task=task, removed=shared, verbose=debug
+                    )
+                else:
+                    ablation_val_correct, ablation_val_total = baseline_val_correct, baseline_val_total
+                    ablation_val_preds = [{"is_correct": True}] * len(val_examples)
+                if control_size > 0:
+                    control_val_correct, control_val_total, control_val_preds = evaluate_predictions(
+                        model, val_examples, task=task, removed=control_removed, verbose=debug
+                    )
+                else:
+                    control_val_correct, control_val_total = baseline_val_correct, baseline_val_total
+                    control_val_preds = [{"is_correct": True}] * len(val_examples)
+                ablation_val_acc = ablation_val_correct / ablation_val_total if ablation_val_total > 0 else float("nan")
+                control_val_acc = control_val_correct / control_val_total if control_val_total > 0 else float("nan")
+            else:
+                ablation_val_acc = control_val_acc = float("nan")
+                ablation_val_preds = control_val_preds = []
+
+            # Permutation tests (paired) for train/val
+            shared_flags_train = [1 if r.get("is_correct") else 0 for r in ablation_train_preds]
+            control_flags_train = [1 if r.get("is_correct") else 0 for r in control_train_preds]
+            perm_train = _permutation_test(shared_flags_train, control_flags_train, trials=int(perm_trials), rng=random.Random(rng_seed + 1)) if len(shared_flags_train) == len(control_flags_train) else {"p_value": 1.0, "obs_diff": 0.0, "trials": 0}
+
+            if val_examples:
+                shared_flags_val = [1 if r.get("is_correct") else 0 for r in ablation_val_preds]
+                control_flags_val = [1 if r.get("is_correct") else 0 for r in control_val_preds]
+                perm_val = _permutation_test(shared_flags_val, control_flags_val, trials=int(perm_trials), rng=random.Random(rng_seed + 2)) if len(shared_flags_val) == len(control_flags_val) else {"p_value": 1.0, "obs_diff": 0.0, "trials": 0}
+            else:
+                perm_val = {"p_value": float("nan"), "obs_diff": float("nan"), "trials": 0}
+
+            thresh_entry = {
+                "threshold": thr,
+                "shared_circuit_size": shared_size,
+                "reuse_percent": reuse_percent,
+                "shared_components": [str(c) for c in sorted(shared, key=lambda c: (c.layer, c.kind, c.index))],
+                "rng_seed": rng_seed,
+                "train": {
+                    "ablation_accuracy": ablation_train_acc,
+                    "control_accuracy": control_train_acc,
+                    "accuracy_drop_ablation": baseline_train_acc - ablation_train_acc,
+                    "accuracy_drop_control": baseline_train_acc - control_train_acc,
+                    "knockout_diff": _safe_div(baseline_train_acc - ablation_train_acc, baseline_train_acc - control_train_acc),
+                    "permutation": perm_train,
+                },
+                "val": {
+                    "ablation_accuracy": ablation_val_acc,
+                    "control_accuracy": control_val_acc,
+                    "accuracy_drop_ablation": (baseline_val_acc - ablation_val_acc) if not math.isnan(baseline_val_acc) else float("nan"),
+                    "accuracy_drop_control": (baseline_val_acc - control_val_acc) if not math.isnan(baseline_val_acc) else float("nan"),
+                    "knockout_diff": _safe_div(baseline_val_acc - ablation_val_acc, baseline_val_acc - control_val_acc) if not math.isnan(baseline_val_acc) else float("nan"),
+                    "permutation": perm_val,
+                },
+            }
+            per_thresh[str(thr)] = thresh_entry
+
+        metrics["by_k"][str(K)] = {
+            "thresholds": per_thresh,
+        }
 
     combo_dir = run_dir
     combo_dir.mkdir(parents=True, exist_ok=True)
@@ -273,28 +341,9 @@ def _run_single_combination(
         json.dump(metrics, f, indent=2, sort_keys=True)
     print(f"[METRICS] {combo_dir/'metrics.json'}")
 
-    # 2) per-example predictions for baseline, shared, control on train split
-    _, _, preds_base = evaluate_predictions(model, train_examples, task=task, removed=None, verbose=debug)
-    preds_rows = []
-    for i in range(len(train_examples)):
-        row = {
-            "index": i,
-            "prompt": train_examples[i].prompt,
-            "target": train_examples[i].target,
-            "baseline_pred": preds_base[i].get("pred", preds_base[i].get("pred_token_id")),
-            "baseline_correct": bool(preds_base[i]["is_correct"]),
-            "shared_pred": preds_shared[i].get("pred", preds_shared[i].get("pred_token_id")),
-            "shared_correct": bool(preds_shared[i]["is_correct"]),
-            "control_pred": preds_control[i].get("pred", preds_control[i].get("pred_token_id")),
-            "control_correct": bool(preds_control[i]["is_correct"]),
-        }
-        preds_rows.append(row)
-    _save_jsonl(combo_dir / "predictions_train.jsonl", preds_rows)
-    print(f"[ARTIFACT] predictions_train.jsonl saved.")
-
-    # 3) per-example attribution rankings and scores (train examples)
+    # Save per-example attribution rankings once
     attrib_rows = []
-    for i, (sset, sc) in enumerate(zip(example_sets, example_scores)):
+    for i, sc in enumerate(example_scores):
         ranked = sorted(sc.items(), key=lambda x: x[1], reverse=True)
         attrib_rows.append({
             "index": i,
@@ -302,7 +351,6 @@ def _run_single_combination(
                 {"layer": c.layer, "kind": c.kind, "index": c.index, "score": float(score)}
                 for (c, score) in ranked
             ],
-            "example_k_used": (None if example_k <= 0 else example_k),
         })
     _save_jsonl(combo_dir / "attributions_train.jsonl", attrib_rows)
     print(f"[ARTIFACT] attributions_train.jsonl saved.")
@@ -326,7 +374,12 @@ def main() -> None:
             print(f"[MEM] post-load allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
 
         digits = args.digits if args.task == "addition" else None
-        combo_name = f"{args.model_name.replace('/', '_')}__{args.hf_revision or 'main'}__{args.task}__{args.method}__n{args.num_examples}__d{digits if args.task=='addition' else 'na'}__K{args.top_k}__ek{args.example_k or 0}"
+        top_k_list = _parse_int_list(args.top_k_list)
+        reuse_thresholds = _parse_int_list(args.reuse_thresholds)
+        combo_name = (
+            f"{args.model_name.replace('/', '_')}__{args.hf_revision or 'main'}__{args.task}__{args.method}__"
+            f"n{args.num_examples}__d{digits if args.task=='addition' else 'na'}__Ks{','.join(map(str, top_k_list))}__reuse{','.join(map(str, reuse_thresholds))}"
+        )
         run_dir = base_run_dir / combo_name
         print(f"\n[RUN] {combo_name}")
 
@@ -336,8 +389,8 @@ def main() -> None:
             task=args.task,
             num_examples=args.num_examples,
             digits=digits,
-            k_shared=args.top_k,
-            example_k=args.example_k,
+            top_k_list=top_k_list,
+            reuse_thresholds=reuse_thresholds,
             device=args.device,
             debug=args.debug,
             run_dir=run_dir,

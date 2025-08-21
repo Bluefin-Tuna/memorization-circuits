@@ -3,17 +3,19 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Iterable
+from typing import List, Tuple, Iterable, Optional
 from datasets import load_dataset
 
 
 @dataclass
 class Example:
-    """Stores a clean prompt/target pair and a corresponding corrupted version."""
+    """Stores a clean and corrupted pair. Optional label set for MC-style eval."""
     prompt: str
     target: str
     corrupted_prompt: str
     corrupted_target: str
+    labels: Optional[List[str]] = None      # per-item label strings for MC tasks
+    answer_idx: Optional[int] = None        # gold index into labels (when applicable)
 
 
 class AdditionDataset:
@@ -90,14 +92,13 @@ class BooleanDataset:
 
     def _evaluate(self, expr: str) -> bool:
         py_expr = expr.replace("true", "True").replace("false", "False")
-        return bool(eval(py_expr))  # noqa: S307 (controlled vocabulary)
+        return bool(eval(py_expr))  # nosec: B307 controlled vocab
 
     def _corrupt_expr(self, expr: str) -> str:
-        """Create a corrupted version of an expression by flipping one boolean literal."""
         literals = ["true", "false"]
         found_literals = [(m.start(), m.end()) for m in re.finditer(r"\b(true|false)\b", expr)]
         if not found_literals:
-            return expr  # No literal to flip
+            return expr
         start, end = random.choice(found_literals)
         original_literal = expr[start:end]
         flipped_literal = "false" if original_literal == "true" else "true"
@@ -147,27 +148,28 @@ class MMLUDataset:
             choices = item["choices"]
             ans_idx = item["answer"]
 
-            # Clean example
             prompt = f"{q}\nA. {choices[0]}\nB. {choices[1]}\nC. {choices[2]}\nD. {choices[3]}\nAnswer: "
             target = chr(ord("A") + ans_idx)
+            labels = ["A", "B", "C", "D"]
 
-            # Corrupted example (shuffled choices)
-            shuffled_choices = choices[:]
-            random.shuffle(shuffled_choices)
+            shuffled = choices[:]
+            random.shuffle(shuffled)
             correct_answer_text = choices[ans_idx]
-            new_ans_idx = shuffled_choices.index(correct_answer_text)
+            new_ans_idx = shuffled.index(correct_answer_text)
 
             corrupted_prompt = (
                 f"{q}\n"
-                f"A. {shuffled_choices[0]}\n"
-                f"B. {shuffled_choices[1]}\n"
-                f"C. {shuffled_choices[2]}\n"
-                f"D. {shuffled_choices[3]}\n"
+                f"A. {shuffled[0]}\n"
+                f"B. {shuffled[1]}\n"
+                f"C. {shuffled[2]}\n"
+                f"D. {shuffled[3]}\n"
                 f"Answer: "
             )
             corrupted_target = chr(ord("A") + new_ans_idx)
 
-            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target))
+            self._examples.append(
+                Example(prompt, target, corrupted_prompt, corrupted_target, labels=labels, answer_idx=ans_idx)
+            )
             if num_examples is not None and i + 1 >= num_examples:
                 break
 
@@ -182,23 +184,27 @@ class MMLUDataset:
 
 
 class IOIDataset:
-    """Loads the Indirect Object Identification (IOI) dataset from MIB-bench."""
+    """Loads the Indirect Object Identification dataset from MIB-bench."""
 
     def __init__(self, split: str = "test", num_examples: int | None = None) -> None:
         ds = load_dataset("mib-bench/ioi", split=split)
         self._examples: List[Example] = []
         count = 0
         for item in ds:
-            # Clean example
-            prompt = item["prompt"]
-            target = item["choices"][item["answerKey"]]
+            # Add explicit boundary space. Keep both candidate names as labels.
+            prompt = item["prompt"].rstrip() + " "
+            choices = list(item["choices"])
+            answer_idx = int(item["answerKey"])
+            target = choices[answer_idx]
 
-            # Corrupted example using the 'random_names_counterfactual'
-            corrupted_item = item["random_names_counterfactual"]
-            corrupted_prompt = corrupted_item["prompt"]
-            corrupted_target = corrupted_item["choices"][corrupted_item["answerKey"]]
+            # Use the IO flip counterfactual by default for IOI
+            cf = item.get("s2_io_flip_counterfactual", item["random_names_counterfactual"])
+            corrupted_prompt = cf["prompt"].rstrip() + " "
+            corrupted_target = target  # unused for scoring
 
-            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target))
+            self._examples.append(
+                Example(prompt, target, corrupted_prompt, corrupted_target, labels=choices, answer_idx=answer_idx)
+            )
             count += 1
             if num_examples is not None and count >= num_examples:
                 break
@@ -224,26 +230,20 @@ class MCQADataset:
     ) -> None:
         if not (2 <= n <= 10):
             raise ValueError(f"MCQA 'n' must be in [2,10], got {n}")
-        
         config = f"{n}_answer_choices"
-
-        # Hugging Face dataset requires a config per n-way subset
-        # e.g., "4_answer_choices". See dataset files for details.
-        # https://huggingface.co/datasets/mib-bench/copycolors_mcqa
         ds = load_dataset("mib-bench/copycolors_mcqa", config, split=split)
         self._examples: List[Example] = []
         count = 0
         for item in ds:
-            # Clean example
             prompt = item["prompt"]
+            labels = list(item["choices"]["label"])
             target = item["choices"]["label"][item["answerKey"]]
 
-            # Corrupted example using 'answerPosition_counterfactual'
-            corrupted_item = item["answerPosition_counterfactual"]
-            corrupted_prompt = corrupted_item["prompt"]
-            corrupted_target = corrupted_item["choices"]["label"][corrupted_item["answerKey"]]
+            cf = item["answerPosition_counterfactual"]
+            corrupted_prompt = cf["prompt"]
+            corrupted_target = cf["choices"]["label"][cf["answerKey"]]
 
-            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target))
+            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target, labels=labels, answer_idx=int(item["answerKey"])))
             count += 1
             if num_examples is not None and count >= num_examples:
                 break
@@ -267,17 +267,15 @@ class ARCDataset:
         self._examples: List[Example] = []
         count = 0
         for item in ds:
-            # Clean example
             prompt = item["prompt"]
-            # The 'label' field contains the actual choice characters (e.g., 'A', 'B', 'C', 'D')
+            labels = list(item["choices"]["label"])
             target = item["choices"]["label"][item["answerKey"]]
 
-            # Corrupted example using 'answerPosition_counterfactual'
-            corrupted_item = item["answerPosition_counterfactual"]
-            corrupted_prompt = corrupted_item["prompt"]
-            corrupted_target = corrupted_item["choices"]["label"][corrupted_item["answerKey"]]
+            cf = item["answerPosition_counterfactual"]
+            corrupted_prompt = cf["prompt"]
+            corrupted_target = cf["choices"]["label"][cf["answerKey"]]
 
-            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target))
+            self._examples.append(Example(prompt, target, corrupted_prompt, corrupted_target, labels=labels, answer_idx=int(item["answerKey"])))
             count += 1
             if num_examples is not None and count >= num_examples:
                 break
