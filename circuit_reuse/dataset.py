@@ -311,6 +311,7 @@ MODEL_DISPLAY_NAMES: dict[str, str] = {
     "meta-llama/Llama-3.2-3B-Instruct": "Llama-3.2-3B Instruct",
     "gemma-2-2b": "Gemma 2 2B",
     "gemma-2-2b-it": "Gemma 2 2B Instruct",
+    "allenai/OLMo-2-0425-1B-early-training": "OLMo-2-1B"
 }
 
 

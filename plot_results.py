@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy import stats
+from tqdm import tqdm
+from matplotlib.ticker import ScalarFormatter
 
 from circuit_reuse.dataset import (
     get_task_display_name,
@@ -19,6 +21,21 @@ from circuit_reuse.dataset import (
 )
 
 METHOD_DISPLAY = {"eap": "EAP", "gradient": "Gradient"}
+
+def _extract_step_from_revision(rev: str) -> str | None:
+    # Matches '...-step123-...' or 'step123' etc.
+    m = re.search(r"(?:^|[-_])step(\d+)(?:$|[-_])", rev)
+    if m:
+        return f"step{m.group(1)}"
+    return None
+
+def _model_display_with_revision(row: pd.Series) -> str:
+    base = get_model_display_name(row.get("model_name"))
+    rev = row.get("hf_revision", None)
+    if pd.isna(rev) or rev is None or str(rev) == "":
+        return base
+    step = _extract_step_from_revision(str(rev))
+    return f"{base} {step}" if step else base
 
 
 def safe_filename(name: str) -> str:
@@ -63,7 +80,7 @@ def to_display_cols(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.copy()
     df["task_display"] = df["task"].apply(get_task_display_name)
-    df["model_display"] = df["model_name"].apply(get_model_display_name)
+    df["model_display"] = df.apply(_model_display_with_revision, axis=1)
     df["method_display"] = df.get("method", pd.Series(dtype=str)).map(METHOD_DISPLAY).fillna(df.get("method", pd.Series(dtype=str)).str.title())
     return df
 
@@ -73,6 +90,10 @@ def compute_ci(p: np.ndarray, n: np.ndarray, z: float) -> np.ndarray:
         err = z * np.sqrt(np.clip(p, 0, 1) * np.clip(1 - p, 0, 1) / np.where(n <= 0, np.nan, n))
     return np.nan_to_num(err)
 
+def _get_figsize(n_tasks: int, aspect: float = 3 / 4) -> tuple[float, float]:
+    width = max(10.0, 0.9 * n_tasks + 3.0)
+    height = max(6.0, min(12.0, width * aspect))
+    return (width, height)
 
 def plot_accuracy_bars(df: pd.DataFrame, out_dir: Path, split: str = "train", percent: bool = True, ci_level: float = -1.0, show: bool = False):
     if df.empty:
@@ -90,7 +111,7 @@ def plot_accuracy_bars(df: pd.DataFrame, out_dir: Path, split: str = "train", pe
     scale = 100 if percent else 1
     z = stats.norm.ppf((1 + ci_level) / 2) if ci_level != -1 else None
 
-    for (model_disp, method_disp, k_val), sub in grouped.groupby(["model_display", "method_display", "top_k"], as_index=False):
+    for (model_disp, method_disp, k_val), sub in tqdm(grouped.groupby(["model_display", "method_display", "top_k"], as_index=False), desc="Plotting accuracy bars"):
         safe_model = safe_filename(model_disp)
         safe_method = safe_filename(str(method_disp).lower())
         safe_k = int(k_val)
@@ -107,23 +128,33 @@ def plot_accuracy_bars(df: pd.DataFrame, out_dir: Path, split: str = "train", pe
         x = np.arange(len(tasks))
         width = 0.25
 
-        plt.figure(figsize=(max(8.0, 1.2 * len(tasks) + 2.5), 7))
-        plt.bar(x - width, base_p.values * scale, width, label="Baseline", yerr=base_e * scale if z is not None else None, capsize=3)
-        plt.bar(x,         abl_p.values * scale, width, label="Ablated (shared)", yerr=abl_e * scale if z is not None else None, capsize=3)
-        plt.bar(x + width, ctrl_p.values * scale, width, label="Control (random)", yerr=ctrl_e * scale if z is not None else None, capsize=3)
+        fig, ax = plt.subplots(figsize=_get_figsize(len(tasks)))
+        b1 = ax.bar(x - width, base_p.values * scale, width, label="Baseline", yerr=base_e * scale if z is not None else None, capsize=3)
+        b2 = ax.bar(x, abl_p.values * scale, width, label="Ablated (shared)", yerr=abl_e * scale if z is not None else None, capsize=3)
+        b3 = ax.bar(x + width, ctrl_p.values * scale, width, label="Control (random)", yerr=ctrl_e * scale if z is not None else None, capsize=3)
 
-        plt.xticks(x, tasks, rotation=30, ha="right")
-        plt.ylabel("Accuracy (%)" if percent else "Accuracy")
-        plt.title(f"{model_disp} • k={safe_k}")
-        plt.grid(axis="y", linestyle="--", alpha=0.6)
-        plt.legend(loc="best")
+        for bars in [b1, b2, b3]:
+            for r in bars:
+                h = r.get_height()
+                if np.isfinite(h):
+                    ax.annotate(f"{h:.1f}", (r.get_x() + r.get_width() / 2, h), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=9)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(tasks, rotation=30, ha="right")
+        ax.set_ylabel("Accuracy (%)" if percent else "Accuracy")
+        ax.set_title(f"{model_disp} k={safe_k}")
+        ax.grid(axis="y", linestyle="--", alpha=0.6)
+
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.06))
+
         outp = out_dir / f"{safe_model}/{safe_k}/{safe_model}_{safe_method}_k{safe_k}_{split}.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
-        plt.tight_layout()
-        plt.savefig(outp, dpi=200)
+        fig.tight_layout()
+        fig.savefig(outp, dpi=200, bbox_inches="tight")
         if show:
             plt.show()
-        plt.close()
+        plt.close(fig)
 
 
 def plot_identifiability_vs_k(df: pd.DataFrame, out_dir: Path, show: bool = False):
@@ -134,29 +165,33 @@ def plot_identifiability_vs_k(df: pd.DataFrame, out_dir: Path, show: bool = Fals
         .agg(cis=("circuit_identifiability_score", "mean"))
         .sort_values("top_k")
     )
-    for (model_disp, method_disp), sub in gk.groupby(["model_display", "method_display"], as_index=False):
+    for (model_disp, method_disp), sub in tqdm(gk.groupby(["model_display", "method_display"], as_index=False), desc="Plotting identifiability vs k"):
         safe_model = safe_filename(model_disp)
         safe_method = safe_filename(str(method_disp).lower())
         tasks = sorted(sub["task_display"].unique())
-        plt.figure(figsize=(max(8.0, 1.2 * len(tasks) + 2.5), 7))
-        cmap = plt.get_cmap("Blues_r")
+        fig, ax = plt.subplots(figsize=_get_figsize(len(tasks)))
+        cmap = plt.get_cmap("viridis")
         ks = sorted(sub["top_k"].unique())
         grads = np.linspace(0.3, 0.9, max(1, len(ks)))
         for i, k in enumerate(ks):
             s = sub[sub["top_k"] == k].set_index("task_display").reindex(tasks)
-            plt.plot(np.arange(len(tasks)), s["cis"].values, marker="o", color=cmap(grads[i]), label=f"k={int(k)}")
-        plt.xticks(np.arange(len(tasks)), tasks, rotation=30, ha="right")
-        plt.ylabel("Circuit identifiability score")
-        plt.title(f"{model_disp}")
-        plt.grid(axis="y", linestyle="--", alpha=0.6)
-        plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.2), ncol=min(6, len(ks)))
+            ax.plot(np.arange(len(tasks)), s["cis"].values, marker="o", color=cmap(grads[i]), label=f"k={int(k)}")
+        ax.set_xticks(np.arange(len(tasks)))
+        ax.set_xticklabels(tasks, rotation=30, ha="right")
+        ax.set_ylabel("Circuit identifiability score")
+        ax.set_title(f"{model_disp}")
+        ax.grid(axis="y", linestyle="--", alpha=0.6)
+
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=len(ks), bbox_to_anchor=(0.5, -0.06))
+
         outp = out_dir / f"{safe_model}/{safe_model}_{safe_method}_cis_vs_k.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
-        plt.tight_layout()
-        plt.savefig(outp, dpi=200, bbox_inches="tight")
+        fig.tight_layout()
+        fig.savefig(outp, dpi=200, bbox_inches="tight")
         if show:
             plt.show()
-        plt.close()
+        plt.close(fig)
 
 
 def plot_knockout_diff_vs_k(df: pd.DataFrame, out_dir: Path, split: str = "train", show: bool = False):
@@ -168,30 +203,38 @@ def plot_knockout_diff_vs_k(df: pd.DataFrame, out_dir: Path, split: str = "train
         .agg(kd=(col, "mean"))
         .sort_values("top_k")
     )
-    for (model_disp, method_disp), sub in gk.groupby(["model_display", "method_display"], as_index=False):
+    for (model_disp, method_disp), sub in tqdm(gk.groupby(["model_display", "method_display"], as_index=False), desc="Plotting knockout diff vs k"):
         safe_model = safe_filename(model_disp)
         safe_method = safe_filename(str(method_disp).lower())
         tasks = sorted(sub["task_display"].unique())
-        plt.figure(figsize=(max(8.0, 1.2 * len(tasks) + 2.5), 7))
+        fig, ax = plt.subplots(figsize=_get_figsize(len(tasks)))
         cmap = plt.get_cmap("viridis")
         ks = sorted(sub["top_k"].unique())
         grads = np.linspace(0.3, 0.9, max(1, len(ks)))
         for i, k in enumerate(ks):
             s = sub[sub["top_k"] == k].set_index("task_display").reindex(tasks)
-            plt.plot(np.arange(len(tasks)), s["kd"].values, marker="o", color=cmap(grads[i]), label=f"k={int(k)}")
-        plt.axhline(1.0, color="gray", linestyle="--", linewidth=1)
-        plt.xticks(np.arange(len(tasks)), tasks, rotation=30, ha="right")
-        plt.ylabel("Knockout diff = (base - shared) / (base - random)")
-        plt.title(f"{model_disp} • {split.title()}")
-        plt.grid(axis="y", linestyle="--", alpha=0.6)
-        plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.2), ncol=min(6, len(ks)))
+            ax.plot(np.arange(len(tasks)), s["kd"].values, marker="o", color=cmap(grads[i]), label=f"k={int(k)}")
+        ax.axhline(1.0, color="gray", linestyle="--", linewidth=1)
+        ax.set_xticks(np.arange(len(tasks)))
+        ax.set_xticklabels(tasks, rotation=30, ha="right")
+        ax.set_ylabel("Ablation Impact Ratio")
+        ax.set_title(f"{model_disp} {split.title()} (base - shared) / (base - random)")
+        ax.grid(axis="y", linestyle="--", alpha=0.6)
+        ax.ticklabel_format(axis="y", style="plain", useOffset=False, scilimits=(0, 0))
+        ax.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
+        ax.yaxis.get_major_formatter().set_scientific(False)
+        ax.yaxis.get_major_formatter().set_useOffset(False)
+
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=len(ks), bbox_to_anchor=(0.5, -0.06))
+
         outp = out_dir / f"{safe_model}/{safe_model}_{safe_method}_knockout_{split}_vs_k.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
-        plt.tight_layout()
-        plt.savefig(outp, dpi=200, bbox_inches="tight")
+        fig.tight_layout()
+        fig.savefig(outp, dpi=200, bbox_inches="tight")
         if show:
             plt.show()
-        plt.close()
+        plt.close(fig)
 
 
 def main():

@@ -44,7 +44,7 @@ for MODEL_NAME in "${MODELS[@]}"; do
                     --device "$DEVICE" \
                     --perm-trials 500 \
                     --run-name "$RUN_NAME" \
-                    --output-dir "$OUT_DIR/$RUN_NAME" \
+                    --output-dir "$OUT_DIR" \
                     --debug \
                 || { echo "[ERROR] Failed for $RUN_NAME"; continue; }
 

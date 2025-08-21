@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import math
@@ -103,14 +101,15 @@ def build_colors_for_models(models: List[str]) -> Dict[str, Tuple[float, float, 
     return {m: base[i % len(base)] for i, m in enumerate(models)}
 
 
-def plot_cis_per_task_per_model(gk: pd.DataFrame, out_dir: Path):
+def plot_cis_per_task_per_model(gk: pd.DataFrame, out_dir: Path, models_order: Optional[List[str]] = None):
     if gk.empty or "cis_mean" not in gk.columns:
         print("[INFO] No data for cis plot.")
         return
 
     sub = gk.copy()
 
-    models = sorted(sub["model_display"].dropna().unique(), key=str)
+    # Use a global, consistent model order if provided
+    models = models_order if models_order is not None else sorted(sub["model_display"].dropna().unique(), key=str)
     tasks = sorted(sub["task_display"].dropna().unique(), key=str)
     ks = sorted(sub["top_k"].dropna().unique())
 
@@ -142,8 +141,8 @@ def plot_cis_per_task_per_model(gk: pd.DataFrame, out_dir: Path):
         tdf = sub[sub["task_display"] == task]
         for j, k in enumerate(ks):
             tk = tdf[tdf["top_k"] == k].set_index("model_display").reindex(models)
-            vals = tk["cis_mean"].values.astype(float)
-            ax.bar(
+            vals = tk["cis_mean"].fillna(0.0).values.astype(float)
+            bars = ax.bar(
                 x + offsets[j],
                 vals,
                 width=bar_w,
@@ -151,13 +150,13 @@ def plot_cis_per_task_per_model(gk: pd.DataFrame, out_dir: Path):
                 edgecolor="none",
                 label=f"k={int(k)}" if i == 0 else None,
             )
-
+    
         ax.set_title(task)
         if i % cols == 0:
             ax.set_ylabel("Circuit identifiability score")
         ax.set_xticks(x)
         ax.set_xticklabels(models, rotation=20, ha="right")
-        ax.set_ylim(0, 1.0)
+        ax.set_ylim(0.0, 1.0)
         ax.grid(axis="y", linestyle="--", alpha=0.6, zorder=0)
         ax.margins(x=0.02, y=-0.05)
 
@@ -184,111 +183,12 @@ def plot_cis_per_task_per_model(gk: pd.DataFrame, out_dir: Path):
     print(f"[INFO] Saved {out}")
 
 
-def plot_ablation_vs_control_by_task(
-    gk: pd.DataFrame,
-    out_dir: Path,
-    split: str,
-    percent: bool,
-):
-    need_cols = {f"ablation_{split}_correct", f"ablation_{split}_total", f"control_{split}_correct", f"control_{split}_total"}
-    if not need_cols.issubset(set(gk.columns)):
-        print("[INFO] Control or ablation columns missing; skipping ablation vs control diff plot.")
-        return
-
-    z = stats.norm.ppf(0.5 + 0.95 / 2.0)
-    for cat in ["ablation", "control"]:
-        c = f"{cat}_{split}_correct"
-        t = f"{cat}_{split}_total"
-        a = f"{cat}_{split}_acc"
-        e = f"{cat}_{split}_err"
-        gk[a], gk[e] = compute_accuracy_and_error(gk[c].values, gk[t].values, z)
-
-    tasks = sorted(gk["task_display"].dropna().unique(), key=str)
-    models = sorted(gk["model_display"].dropna().unique(), key=str)
-    ks = sorted(gk["top_k"].dropna().unique())
-
-    # Always scale to percentage (0-100).
-    scale = 100.0
-
-    n = len(tasks)
-    rows, cols = grid_fixed_cols(n, default_cols=3)
-
-    width_per_ax = max(5.2, 0.9 * max(3, len(models)))
-    height_per_ax = 4.0
-    fig_w = max(12.0, cols * width_per_ax)
-    fig_h = max(5.0, rows * height_per_ax)
-
-    fig, axes = plt.subplots(
-        rows, cols, figsize=(fig_w, fig_h), sharey=True, constrained_layout=True
-    )
-    if not isinstance(axes, np.ndarray):
-        axes = np.array([axes])
-    axes = axes.flatten()
-
-    cmap = plt.get_cmap("viridis")
-    grad_vals = np.linspace(0.3, 0.9, max(1, len(ks)))
-    k_colors = {k: cmap(grad_vals[i]) for i, k in enumerate(ks)}
-
-    x = np.arange(len(models))
-    n_k = max(1, len(ks))
-    bar_w = min(0.9 / n_k, 0.9)
-    offsets = np.linspace(-(n_k - 1) / 2.0, (n_k - 1) / 2.0, n_k) * bar_w
-
-    for i, task in enumerate(tasks):
-        ax = axes[i]
-        sub = gk[gk["task_display"] == task].copy()
-        for j, k in enumerate(ks):
-            sk = sub[sub["top_k"] == k].set_index("model_display").reindex(models)
-            diff_vals = (sk[f"control_{split}_acc"] - sk[f"ablation_{split}_acc"]) * scale
-            diff_vals = diff_vals.fillna(0.0).astype(float).values
-            ax.bar(
-                x + offsets[j],
-                diff_vals,
-                width=bar_w,
-                color=k_colors[k],
-                edgecolor="none",
-                label=f"k={int(k)}" if i == 0 else None,
-            )
-
-        ax.set_title(task)
-
-        if i % cols == 0:
-            ax.set_ylabel("Control - Ablation (%)")
-        ax.set_xticks(x)
-        ax.set_xticklabels(models, rotation=20, ha="right")
-        ax.grid(axis="y", linestyle="--", alpha=0.6, zorder=0)
-        ax.margins(x=0.02, y=-0.05)
-
-        ax.set_ylim(-60, 110)
-
-    for j in range(len(tasks), len(axes)):
-        fig.delaxes(axes[j])
-
-    handles = [plt.Rectangle((0, 0), 1, 1, color=k_colors[k]) for k in ks]
-    labels = [f"k={int(k)}" for k in ks]
-    fig.legend(
-        handles, labels,
-        loc="lower center",
-        ncol=min(len(ks), 6),
-        frameon=True,
-        bbox_to_anchor=(0.5, -0.05),
-        borderaxespad=0.2,
-        handletextpad=0.6,
-        columnspacing=0.8,
-    )
-
-    out = out_dir / f"multiplot_ablation_vs_control_{split}.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=200, bbox_inches="tight", pad_inches=0.03)
-    plt.close(fig)
-    print(f"[INFO] Saved {out}")
-
-
 def plot_drop_by_model_k_per_task(
     gk: pd.DataFrame,
     out_dir: Path,
     split: str,
     percent: bool,
+    models_order: Optional[List[str]] = None,
 ):
     need = {f"baseline_{split}_correct", f"baseline_{split}_total", f"ablation_{split}_correct", f"ablation_{split}_total"}
     if not need.issubset(set(gk.columns)):
@@ -304,7 +204,8 @@ def plot_drop_by_model_k_per_task(
         gk[a], gk[e] = compute_accuracy_and_error(gk[c].values, gk[t].values, z)
 
     tasks = sorted(gk["task_display"].dropna().unique(), key=str)
-    models = sorted(gk["model_display"].dropna().unique(), key=str)
+    # Use a global, consistent model order if provided
+    models = models_order if models_order is not None else sorted(gk["model_display"].dropna().unique(), key=str)
     ks = sorted(gk["top_k"].dropna().unique())
 
     # Always scale to percentage (0-100).
@@ -341,7 +242,7 @@ def plot_drop_by_model_k_per_task(
             sk = sub[sub["top_k"] == k].set_index("model_display").reindex(models)
             drop_vals = (sk[f"baseline_{split}_acc"] - sk[f"ablation_{split}_acc"]) * scale
             drop_vals = drop_vals.fillna(0.0).astype(float).values
-            ax.bar(
+            bars = ax.bar(
                 x + offsets[j],
                 drop_vals,
                 width=bar_w,
@@ -384,6 +285,105 @@ def plot_drop_by_model_k_per_task(
     print(f"[INFO] Saved {out}")
 
 
+def plot_shared_lift(
+    gk: pd.DataFrame,
+    out_dir: Path,
+    split: str,
+    models_order: Optional[List[str]] = None,
+    percent: bool = True,
+):
+    need = {
+        f"baseline_{split}_correct", f"baseline_{split}_total",
+        f"ablation_{split}_correct", f"ablation_{split}_total",
+        f"control_{split}_correct",  f"control_{split}_total",
+    }
+    if not need.issubset(set(gk.columns)):
+        print("[INFO] Missing baseline/ablation/control columns; skipping rel diff plot.")
+        return
+
+    # accuracies
+    for cat in ["baseline", "ablation", "control"]:
+        c = f"{cat}_{split}_correct"
+        t = f"{cat}_{split}_total"
+        a = f"{cat}_{split}_acc"
+        gk[a], _ = compute_accuracy_and_error(gk[c].values, gk[t].values, z_score=None)
+
+    tasks = sorted(gk["task_display"].dropna().unique(), key=str)
+    models = models_order if models_order is not None else sorted(gk["model_display"].dropna().unique(), key=str)
+    ks = sorted(gk["top_k"].dropna().unique())
+
+    rows, cols = grid_fixed_cols(len(tasks), default_cols=3)
+    width_per_ax = max(5.2, 0.9 * max(3, len(models)))
+    height_per_ax = 4.0
+    fig_w = max(12.0, cols * width_per_ax)
+    fig_h = max(5.0, rows * height_per_ax)
+
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), sharey=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+    axes = axes.flatten()
+    
+    fig.subplots_adjust(hspace=0.1)
+
+    # color encodes k
+    cmap = plt.get_cmap("viridis")
+    grad = np.linspace(0.3, 0.9, max(1, len(ks)))
+    k_colors = {k: cmap(grad[i]) for i, k in enumerate(ks)}
+
+    x = np.arange(len(models))
+    n_k = max(1, len(ks))
+    bar_w = min(0.9 / n_k, 0.9)
+    offsets = np.linspace(-(n_k - 1) / 2.0, (n_k - 1) / 2.0, n_k) * bar_w
+
+    scale = 100.0 if percent else 1.0
+
+    for i, task in enumerate(tasks):
+        ax = axes[i]
+        sub = gk[gk["task_display"] == task].copy()
+
+        for j, k in enumerate(ks):
+            sk = sub[sub["top_k"] == k].set_index("model_display").reindex(models)
+
+            base = sk[f"baseline_{split}_acc"].values.astype(float)
+            shared = sk[f"ablation_{split}_acc"].values.astype(float)
+            ctrl = sk[f"control_{split}_acc"].values.astype(float)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                denom = np.where(base <= 0, np.nan, base)
+                rel_diff = (shared - ctrl) / denom
+
+            vals = np.nan_to_num(rel_diff) * scale
+            ax.bar(x + offsets[j], vals, width=bar_w, color=k_colors[k], edgecolor="none",
+                   label=f"k={int(k)}" if i == 0 else None)
+
+        ax.set_title(task)
+        if i % cols == 0:
+            ax.set_ylabel("Normalized Lift (%)" if percent else "Normalized Lift")
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=20, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.6, zorder=0)
+        ax.margins(x=0.02, y=-0.05)
+        ax.set_ylim(-120 if percent else -1.2, 120 if percent else 1.2)
+
+    for j in range(len(tasks), len(axes)):
+        fig.delaxes(axes[j])
+
+    handles = [plt.Rectangle((0, 0), 1, 1, color=k_colors[k]) for k in ks]
+    labels = [f"k={int(k)}" for k in ks]
+    fig.legend(handles, labels, loc="lower center", ncol=min(len(ks), 6),
+               frameon=True, bbox_to_anchor=(0.5, -0.06))
+
+    fig.suptitle("Shared lift vs control, normalized by baseline", fontsize=20, y=1.1)
+    fig.text(0.5, 1.04, "Formula: (shared accuracy - control accuracy) / baseline accuracy",
+             ha="center", va="center", fontsize=12, color="0.35")
+
+    out = out_dir / f"multiplot_rel_diff_shared_minus_control_over_base_{split}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=200, bbox_inches="tight", pad_inches=0.03)
+    plt.close(fig)
+    print(f"[INFO] Saved {out}")
+    
+
 def parse_args():
     p = argparse.ArgumentParser(description="New multiplots for circuit reuse experiments.")
     p.add_argument("--results-dir", type=str, default="results", help="Directory containing run subdirs with metrics.json.")
@@ -393,6 +393,23 @@ def parse_args():
     p.add_argument("--method", type=str, default="eap", choices=["eap", "gradient"], help="Filter to a single method.")
     return p.parse_args()
 
+
+def _model_display_with_revision(row: pd.Series) -> str:
+    base = get_model_display_name(row.get("model_name"))
+    rev = row.get("hf_revision", None)
+    if pd.isna(rev) or rev is None or str(rev) == "":
+        return base
+    m = re.search(r"(?:^|[-_])step(\d+)(?:$|[-_])", str(rev))
+    step = f"step{m.group(1)}" if m else None
+    return f"{base} {step}" if step else base
+
+def _model_sort_key_from_display(md: str):
+    # Extract "stepN" if present; otherwise treat as very large so non-steps go last.
+    m = re.search(r"(?:^|\s)step(\d+)\b", md)
+    step = int(m.group(1)) if m else 10**12
+    # Base is model display without the trailing " stepN"
+    base = re.sub(r"\s+step\d+\b", "", md).strip()
+    return (base, step, md)
 
 def main():
     args = parse_args()
@@ -404,7 +421,7 @@ def main():
         return
 
     df["task_display"] = df["task"].apply(get_task_display_name)
-    df["model_display"] = df["model_name"].apply(get_model_display_name)
+    df["model_display"] = df.apply(_model_display_with_revision, axis=1)
 
     df = df[df["method"] == args.method].copy()
     print(f"[INFO] Using method: {METHOD_DISPLAY.get(args.method, args.method.title())}")
@@ -427,6 +444,10 @@ def main():
              cis_mean=("circuit_identifiability_score", "mean"))
     )
 
+    # Use numeric step ordering within each base model
+    models_unique = list(gk["model_display"].dropna().unique())
+    models_order = sorted(models_unique, key=_model_sort_key_from_display)
+
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_dir) if args.output_dir else results_dir / f"plots_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -439,9 +460,12 @@ def main():
 
     # Always use percentage scaling in plots.
     percent = True
-    plot_drop_by_model_k_per_task(gk.copy(), out_dir, split=args.split, percent=percent)
-    plot_cis_per_task_per_model(gk.copy(), out_dir)
-    plot_ablation_vs_control_by_task(gk.copy(), out_dir, split=args.split, percent=percent)
+    plot_drop_by_model_k_per_task(gk.copy(), out_dir, split=args.split, percent=percent, models_order=models_order)
+    plot_cis_per_task_per_model(gk.copy(), out_dir, models_order=models_order)
+    plot_shared_lift(gk.copy(), out_dir, split=args.split, models_order=models_order, percent=True)
 
     if args.show:
         plt.show()
+        
+if __name__ == "__main__":
+    main()
