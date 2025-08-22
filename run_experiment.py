@@ -158,12 +158,13 @@ def _sample_control_components(
     shared: List[Component],
     all_components: List[Component],
     rng: random.Random,
+    parity: bool = False,
 ) -> List[Component]:
     """
     Sample a control set with the same number of attention heads and MLPs
     as the shared circuit. Sampling is without replacement within each type.
-    We do not exclude shared components from the sampling pool to keep parity
-    with the prior behavior of sampling from the full set.
+    If parity is True, shared components are included in the sampling pool.
+    If parity is False, shared components are excluded from the sampling pool.
     """
     if not shared:
         return []
@@ -173,8 +174,12 @@ def _sample_control_components(
     n_shared_mlps = sum(1 for c in shared if c.kind == "mlp")
 
     # Build pools for heads and mlps
-    head_pool = [c for c in all_components if c.kind == "head"]
-    mlp_pool = [c for c in all_components if c.kind == "mlp"]
+    if parity:
+        head_pool = [c for c in all_components if c.kind == "head"]
+        mlp_pool = [c for c in all_components if c.kind == "mlp"]
+    else:
+        head_pool = [c for c in all_components if c.kind == "head" and c not in shared]
+        mlp_pool = [c for c in all_components if c.kind == "mlp" and c not in shared]
 
     # Guard against impossible requests (shouldn't happen under normal configs)
     n_heads_to_sample = min(n_shared_heads, len(head_pool))
