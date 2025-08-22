@@ -1,4 +1,4 @@
-# Circuit Reuse Experiments (v2)
+# Circuit Reuse Experiments
 
 This repo measures per-example circuits and shared reuse across examples, then ablates the shared circuit vs a size-matched random control to assess causal importance.
 
@@ -11,7 +11,7 @@ High-level flow:
 
 Outputs are saved per run into a folder with:
 
-- metrics.json (version 2) – aggregated metrics by top-K and threshold
+- metrics.json – aggregated metrics by top-K and threshold
 - attributions_train.jsonl – per-example ranked components and scores
 
 ## Quick start

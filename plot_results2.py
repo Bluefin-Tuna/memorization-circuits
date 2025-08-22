@@ -1,211 +1,358 @@
+from __future__ import annotations
 import argparse
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
+from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib.colors import Normalize
+from matplotlib.patches import Patch
 
-from circuit_reuse.dataset import get_model_display_name, get_task_display_name
+from circuit_reuse.dataset import get_task_display_name, get_model_display_name
 
 METHOD_DISPLAY = {"eap": "EAP", "gradient": "Gradient"}
+
+SKIP_TASKS = ["arc_easy"]
+
+def _extract_step_from_revision(rev: str) -> Optional[str]:
+    m = re.search(r"(?:^|[-_])step(\d+)(?:$|[-_])", str(rev) if rev is not None else "")
+    return f"step{m.group(1)}" if m else None
+
+
+def _model_display_with_revision(row: pd.Series) -> str:
+    base = get_model_display_name(row.get("model_name"))
+    rev = row.get("hf_revision", None)
+    if pd.isna(rev) or rev is None or str(rev) == "":
+        return base
+    step = _extract_step_from_revision(str(rev))
+    return f"{base} {step}" if step else base
+
 
 def safe_filename(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))
     s = re.sub(r"_+", "_", s)
     return s.strip("_.")
 
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--results-dir", type=str, default="results")
+    p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument("--show", action="store_true")
+    p.add_argument("--percent", action="store_true", default=True)
+    return p.parse_args()
+
+
 def discover_metrics(results_dir: Path) -> List[Path]:
     if not results_dir.exists():
         return []
     return sorted(results_dir.rglob("metrics.json"))
 
+
 def load_metrics_json(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r") as f:
-            d = json.load(f)
-        d["_metrics_path"] = str(path)
-        return d
-    except Exception:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARN] Failed to load {path}: {e}")
         return {}
 
-def aggregate(paths: List[Path]) -> pd.DataFrame:
-    rows = [d for p in paths if (d := load_metrics_json(p))]
-    if not rows:
-        return pd.DataFrame()
-    expanded: List[Dict[str, Any]] = []
-    for r in rows:
-        if int(r.get("version", 1)) != 2:
+
+def _expand_v2(r: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    base = {
+        "version": r.get("version", 1),
+        "model_name": r.get("model_name"),
+        "hf_revision": r.get("hf_revision"),
+        "task": r.get("task"),
+        "method": r.get("method"),
+        "num_examples": r.get("num_examples"),
+        "baseline_train_accuracy": r.get("baseline_train_accuracy"),
+        "baseline_val_accuracy": r.get("baseline_val_accuracy"),
+    }
+
+    by_k = (r.get("by_k") or {})
+    for k_str, block in by_k.items():
+        try:
+            K = int(k_str)
+        except Exception:
             continue
-        base = {
-            "model_name": r.get("model_name"),
-            "hf_revision": r.get("hf_revision"),
-            "task": r.get("task"),
-            "method": r.get("method"),
-            "num_examples": r.get("num_examples"),
-            "baseline_train_accuracy": r.get("baseline_train_accuracy"),
-            "baseline_val_accuracy": r.get("baseline_val_accuracy"),
-            "_metrics_path": r.get("_metrics_path"),
-        }
-        by_k = r.get("by_k", {}) or {}
-        for k_str, block in by_k.items():
+
+        thresholds = (block.get("thresholds") or {})
+        for p_str, tblock in thresholds.items():
             try:
-                K = int(k_str)
+                P = int(p_str)
             except Exception:
                 continue
-            thresholds = (block.get("thresholds", {}) or {})
-            for p_str, tblock in thresholds.items():
-                try:
-                    P = int(p_str)
-                except Exception:
-                    continue
-                row = dict(base)
-                row.update({
-                    "top_k": K,
-                    "reuse_threshold": P,
-                    "reuse_percent": tblock.get("reuse_percent"),
-                    "shared_circuit_size": tblock.get("shared_circuit_size"),
-                    "train_knockout_diff": (tblock.get("train", {}) or {}).get("knockout_diff"),
-                    "val_knockout_diff": (tblock.get("val", {}) or {}).get("knockout_diff"),
-                    "perm_train_p": ((tblock.get("train", {}) or {}).get("permutation", {}) or {}).get("p_value"),
-                    "perm_train_obs": ((tblock.get("train", {}) or {}).get("permutation", {}) or {}).get("obs_diff"),
-                    "perm_val_p": ((tblock.get("val", {}) or {}).get("permutation", {}) or {}).get("p_value"),
-                    "perm_val_obs": ((tblock.get("val", {}) or {}).get("permutation", {}) or {}).get("obs_diff"),
-                })
-                expanded.append(row)
-    return pd.DataFrame(expanded)
 
-def style_init():
-    sns.set_theme(style="ticks", context="talk", palette="colorblind")
-    plt.rcParams.update({
-        "font.family": "DejaVu Sans",
-        "figure.dpi": 120,
-        "axes.titlesize": 14,
-        "axes.labelsize": 12,
-        "legend.fontsize": 10,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-    })
+            tr = (tblock.get("train") or {})
+            va = (tblock.get("val") or {})
+            row = dict(base)
+            row.update({
+                "top_k": K,
+                "reuse_threshold": P,
+                "reuse_percent": tblock.get("reuse_percent"),
+                "shared_circuit_size": tblock.get("shared_circuit_size"),
+                "ablation_train_accuracy": tr.get("ablation_accuracy"),
+                "control_train_accuracy": tr.get("control_accuracy"),
+                "ablation_val_accuracy": va.get("ablation_accuracy"),
+                "control_val_accuracy": va.get("control_accuracy"),
+                "knockout_diff_train": tr.get("knockout_diff"),
+                "knockout_diff_val": va.get("knockout_diff"),
+            })
+            rows.append(row)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Plot reuse@p and lift vs threshold from metrics.json v2, one figure per task.")
-    p.add_argument("--results-dir", type=str, default="results")
-    p.add_argument("--output-dir", type=str, default=None)
-    p.add_argument("--show", action="store_true")
-    return p.parse_args()
+    return rows
 
-def _model_display_with_revision(row: pd.Series) -> str:
-    base = get_model_display_name(row.get("model_name"))
-    rev = row.get("hf_revision")
-    return base if not rev or str(rev).strip() == "" else f"{base} ({rev})"
 
-def _save(fig, path: Path, show: bool):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
-    if show:
-        plt.show()
-    plt.close(fig)
+def aggregate(paths: List[Path]) -> pd.DataFrame:
+    expanded: List[Dict[str, Any]] = []
+    for p in paths:
+        r = load_metrics_json(p)
+        if not r:
+            continue
 
-def _per_task_lineplot(df: pd.DataFrame, x: str, y: str, ylabel: str, title_prefix: str, out_name: str, show: bool):
-    for method, sub_m in df.groupby("method_display"):
-        for task, sub in sub_m.groupby("task_display"):
-            fig, ax = plt.subplots(figsize=(9, 5))
-            # style by top_k, color by model
-            sns.lineplot(
-                data=sub.sort_values([x, "top_k"]),
-                x=x,
-                y=y,
-                hue="model_display",
-                style="top_k",
-                markers=True,
-                dashes=False,
-                ax=ax,
-            )
-            if y == "reuse_percent":
-                ax.set_ylim(0, 100)
-            if y == "neglog10_p":
-                ax.axhline(-np.log10(0.05), ls="--", c="0.5", lw=1)
-            ax.grid(True, axis="y", linestyle="--", alpha=0.5)
-            ax.set_xlabel("threshold p")
-            ax.set_ylabel(ylabel)
-            ax.set_title(f"{title_prefix} — {task} — {method}")
-            ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, title="")
-            _save(fig, out_name(task, method), show)
+        if int(r.get("version", 1)) >= 2 and "by_k" in r:
+            expanded.extend(_expand_v2(r))
+        else:
+            expanded.append(r)
 
-def main():
-    args = parse_args()
-    results_dir = Path(args.results_dir)
-    out_dir = Path(args.output_dir) if args.output_dir else (results_dir / f"plots_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    return pd.DataFrame(expanded) if expanded else pd.DataFrame()
 
-    style_init()
-    paths = discover_metrics(results_dir)
-    df = aggregate(paths)
+
+def to_display(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
-        print(f"[WARN] No v2 metrics found under {results_dir}")
-        return
+        return df
 
     df = df.copy()
-    df["task_display"] = df["task"].apply(get_task_display_name)
+    if "task" in df.columns:
+        df["task_display"] = df["task"].apply(get_task_display_name)
+
     df["model_display"] = df.apply(_model_display_with_revision, axis=1)
     df["method_display"] = df.get("method", pd.Series(dtype=str)).map(METHOD_DISPLAY).fillna(
         df.get("method", pd.Series(dtype=str)).str.title()
     )
+    return df
 
-    csv_path = out_dir / "aggregated_by_task_model_k.csv"
-    df.to_csv(csv_path, index=False)
-    print(f"[WRITE] {csv_path}")
 
-    # reuse@p per task
-    def out_reuse(task, method):
-        return out_dir / "by_task" / safe_filename(task) / f"{safe_filename(method)}_reuse_vs_threshold.png"
-    _per_task_lineplot(df, x="reuse_threshold", y="reuse_percent", ylabel="reuse@p (%)",
-                       title_prefix="Reuse vs threshold", out_name=out_reuse, show=args.show)
+def compute_lift(df: pd.DataFrame, split: str) -> pd.Series:
+    b = df[f"baseline_{split}_accuracy"].astype(float)
+    a = df[f"ablation_{split}_accuracy"].astype(float)
+    c = df[f"control_{split}_accuracy"].astype(float)
 
-    # lift per task (train preferred, else val)
-    df = df.assign(lift=df["train_knockout_diff"].where(df["train_knockout_diff"].notna(), df["val_knockout_diff"]))
-    def out_lift(task, method):
-        return out_dir / "by_task" / safe_filename(task) / f"{safe_filename(method)}_lift_vs_threshold.png"
-    _per_task_lineplot(df.dropna(subset=["lift"]), x="reuse_threshold", y="lift", ylabel="knockout diff (lift)",
-                       title_prefix="Lift vs threshold", out_name=out_lift, show=args.show)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lift = (a - c) / b
 
-    # permutation significance per task
-    df_sig = df.copy()
-    df_sig["perm_p"] = df_sig["perm_train_p"].where(df_sig["perm_train_p"].notna(), df_sig["perm_val_p"])
-    df_sig = df_sig.dropna(subset=["perm_p"])
-    if not df_sig.empty:
-        df_sig["neglog10_p"] = -np.log10(np.clip(df_sig["perm_p"].astype(float), 1e-12, 1.0))
-        def out_sig(task, method):
-            return out_dir / "by_task" / safe_filename(task) / f"{safe_filename(method)}_perm_neglog10p_vs_threshold.png"
-        _per_task_lineplot(df_sig, x="reuse_threshold", y="neglog10_p", ylabel="-log10 p",
-                           title_prefix="Permutation significance", out_name=out_sig, show=args.show)
+    return pd.to_numeric(lift).replace([np.inf, -np.inf], np.nan)
 
-    # permutation summary table stays the same
-    table_cols = [
-        "model_display", "task_display", "method_display", "top_k", "reuse_threshold",
-        "perm_p", "perm_obs_diff",
-    ]
-    df_perm = df.copy()
-    df_perm["perm_p"] = df_perm["perm_train_p"].where(df_perm["perm_train_p"].notna(), df_perm["perm_val_p"])
-    df_perm["perm_obs_diff"] = df_perm["perm_train_obs"].where(df_perm["perm_train_obs"].notna(), df_perm["perm_val_obs"])
-    latex_df = df_perm[table_cols].sort_values(
-        ["model_display", "task_display", "method_display", "top_k", "reuse_threshold"]
-    )
-    latex_path = out_dir / "permutation_summary.tex"
-    try:
-        with latex_path.open("w") as f:
-            f.write(latex_df.to_latex(index=False, float_format=lambda x: f"{x:.4f}"))
-        print(f"[WRITE] {latex_path}")
-    except Exception as e:
-        print(f"[WARN] Failed to write LaTeX table: {e}")
 
-    if args.show:
-        plt.show()
+def compute_reuse(df: pd.DataFrame, percent: bool, top_k_col="top_k") -> pd.Series:
+    if "reuse_percent" in df.columns and df["reuse_percent"].notna().any():
+        val = df["reuse_percent"].astype(float)
+        return val if percent else (val / 100.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        frac = (df["shared_circuit_size"].astype(float) / df[top_k_col].astype(float))
+
+    return (frac * 100.0) if percent else frac
+
+
+def _subplot_grid(n: int) -> Tuple[int, int]:
+    rows = max(1, (n + 2) // 3)
+    cols = min(3, n)
+    return rows, cols
+
+
+def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: bool, show: bool):
+    df_k = df_k[~df_k["task"].isin(SKIP_TASKS)]
+
+    ps_sorted = sorted(df_k["reuse_threshold"].dropna().unique().tolist())
+    norm = Normalize(vmin=min(ps_sorted), vmax=max(ps_sorted))
+    cmap = plt.get_cmap("rocket")
+    colors = {p: cmap(norm(p)) for p in ps_sorted}
+
+    tasks = sorted(df_k["task_display"].dropna().unique().tolist())
+    models = sorted(df_k["model_display"].dropna().unique().tolist())
+    methods = sorted(df_k["method_display"].dropna().unique().tolist())
+    
+    FONT_SIZES = {
+        "title": 36,
+        "suptitle": 32,
+        "label": 32,
+        "tick": 24,
+        "legend_title": 26,
+    }
+
+    shared_plot_params = {
+        "figsize": (3.5 * len(tasks), 2.0 * len(models)),
+        "constrained_layout": False,
+        "squeeze": False,
+    }
+    shared_ticklabel_params = {"rotation": 30, "ha": "right", "fontsize": FONT_SIZES["tick"]}
+    shared_grid_params = {"axis": "y", "linestyle": "-", "alpha": 0.8}
+
+    def _plot_bars(ax, metric_map, ylabel, ylim, show_ylabel, show_xlabel):
+        xloc = np.arange(len(models))
+        nP = len(ps_sorted)
+        width = min(0.8 / max(1, nP), 0.25)
+        offs = (np.arange(nP) - (nP - 1) / 2.0) * (width + 0.015)
+
+        for j, model in enumerate(models):
+            for i, p in enumerate(ps_sorted):
+                y = metric_map.get((model, p), np.nan)
+                if not np.isnan(y):
+                    ax.bar(
+                        xloc[j] + offs[i],
+                        y,
+                        width=width,
+                        color=colors[p],
+                        edgecolor="black",
+                        linewidth=0.4
+                    )
+
+        ax.set_xticks(xloc)
+        if show_xlabel:
+            ax.set_xticklabels(models, **shared_ticklabel_params)
+        else:
+            ax.set_xticklabels([])
+
+        ax.tick_params(axis="y", labelsize=20)
+
+        if show_ylabel:
+            ax.set_ylabel(ylabel, fontsize=36)
+            ax.tick_params(axis="y", labelsize=FONT_SIZES["tick"])
+        else:
+            ax.tick_params(axis="y", labelleft=False)
+
+
+        ax.grid(**shared_grid_params)
+        ax.set_ylim(*ylim)
+
+    for method in methods:
+        sub_m = df_k[df_k["method_display"] == method].copy()
+        if sub_m.empty:
+            continue
+
+        sub_m["lift"] = compute_lift(sub_m, split=split)
+        rows, cols = _subplot_grid(len(tasks))
+        fig, axes = plt.subplots(rows, cols, **shared_plot_params)
+        fig.subplots_adjust(wspace=0.1, hspace=0.3)
+
+        for idx, task in enumerate(tasks):
+            ax = axes[idx // cols][idx % cols]
+            dd = sub_m[sub_m["task_display"] == task]
+            metric_map: Dict[Tuple[str, int], float] = {}
+            for _, row in dd.iterrows():
+                metric_map[(row["model_display"], int(row["reuse_threshold"]))] = row["lift"]
+
+            _plot_bars(
+                ax,
+                metric_map,
+                ylabel="Lift",
+                ylim=(-1.0, 0.5),
+                show_ylabel=(idx % cols == 0),
+                show_xlabel=(idx // cols == rows - 1),
+            )
+            ax.axhline(0.0, color="gray", linewidth=1, linestyle="--", alpha=0.7)
+            ax.set_title(task, fontsize=FONT_SIZES["title"], pad=20)
+
+        for k in range(len(tasks), rows * cols):
+            fig.delaxes(axes[k // cols][k % cols])
+
+        handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
+        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=(0.5, -0.2), fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
+
+        k_val = int(df_k["top_k"].iloc[0])
+        outp = out_dir / f"multiplot_lift_k{k_val}_{safe_filename(method.lower())}_{split}.png"
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(outp, dpi=200, bbox_inches="tight")
+        print(f"[INFO] Saved plot to {outp}")
+
+        if show:
+            plt.show()
+        plt.close(fig)
+
+        sub_m["reuse_metric"] = compute_reuse(sub_m, percent=percent)
+        fig, axes = plt.subplots(rows, cols, **shared_plot_params)
+        fig.subplots_adjust(wspace=0.1, hspace=0.3)
+
+        for idx, task in enumerate(tasks):
+            ax = axes[idx // cols][idx % cols]
+            dd = sub_m[sub_m["task_display"] == task]
+            metric_map: Dict[Tuple[str, int], float] = {}
+            for _, row in dd.iterrows():
+                metric_map[(row["model_display"], int(row["reuse_threshold"]))] = row["reuse_metric"]
+
+            _plot_bars(
+                ax,
+                metric_map,
+                ylabel="Reuse (%)" if percent else "Reuse (frac)",
+                ylim=(0, 100 if percent else 1),
+                show_ylabel=(idx % cols == 0),
+                show_xlabel=(idx // cols == rows - 1),
+            )
+            ax.set_title(task, fontsize=FONT_SIZES["title"], pad=20)
+
+        for k in range(len(tasks), rows * cols):
+            fig.delaxes(axes[k // cols][k % cols])
+
+        handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
+        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=(0.5, -0.2), fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
+
+        outp = out_dir / f"multiplot_reuse_k{k_val}_{safe_filename(method.lower())}.png"
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(outp, dpi=200, bbox_inches="tight")
+        print(f"[INFO] Saved plot to {outp}")
+
+        if show:
+            plt.show()
+        plt.close(fig)
+
+
+def main():
+    args = parse_args()
+    results_dir = Path(args.results_dir)
+    paths = discover_metrics(results_dir)
+    df = aggregate(paths)
+
+    if df.empty:
+        print("[INFO] No metrics.json found.")
+        return
+
+    df = to_display(df)
+    sns.set_theme(style="ticks", context="notebook", palette="colorblind")
+    plt.rcParams.update({"font.family": "serif", "font.size": 14})
+
+    available_reuse_ps = df["reuse_threshold"].dropna().unique().tolist()
+    if available_reuse_ps:
+        df = df[df["reuse_threshold"].isin(available_reuse_ps)]
+
+    out_dir = Path(args.output_dir) if args.output_dir else results_dir / f"plots_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for split in ["train", "val"]:
+        out_dir_split = out_dir / split
+        out_dir_split.mkdir(parents=True, exist_ok=True)
+
+        for k_val, df_k in df.groupby("top_k"):
+            if df_k.empty:
+                continue
+
+            _multiplot_for_k(
+                df_k.sort_values(["task_display", "model_display", "method_display", "reuse_threshold"]),
+                out_dir_split,
+                split=split,
+                percent=args.percent,
+                show=args.show
+            )
+
 
 if __name__ == "__main__":
     main()
