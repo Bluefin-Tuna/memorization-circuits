@@ -209,6 +209,7 @@ def _run_single_combination(
     model, model_name: str, task: str, num_examples: int, digits: int | None,
     top_k_list: List[int], reuse_thresholds: List[int], device: str, debug: bool, run_dir: Path, amp: bool,
     val_fraction: float, method: str, hf_revision: str | None, perm_trials: int,
+    ignore_type: bool
 ):
     dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
     print(f"[{model_name}/{task}] Generated {len(dataset)} examples for method '{method}'.")
@@ -302,7 +303,7 @@ def _run_single_combination(
             # Evaluate ablations and collect per-example correctness for permutation tests
             rng_seed = int(hashlib.md5(f"{combo_key_root}|K{K}|p{thr}".encode("utf-8")).hexdigest()[:8], 16)
             rng = random.Random(rng_seed)
-            control_removed = _sample_control_components(shared, all_components, rng, ignore_type=args.ignore_type) if shared_size > 0 else []
+            control_removed = _sample_control_components(shared, all_components, rng, ignore_type=ignore_type) if shared_size > 0 else []
 
             if shared_size > 0:
                 ablation_train_correct, ablation_train_total, ablation_train_preds = evaluate_predictions(
@@ -449,6 +450,7 @@ def main() -> None:
             method=args.method,
             hf_revision=args.hf_revision,
             perm_trials=args.perm_trials,
+            ignore_type=args.ignore_type
         )
 
     except Exception as e:
