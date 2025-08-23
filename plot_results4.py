@@ -1,12 +1,10 @@
 from __future__ import annotations
 import argparse
 import json
-import math
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -46,7 +44,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--results-dir", type=str, default="results")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--show", action="store_true")
-    p.add_argument("--percent", action="store_true", default=True)
     return p.parse_args()
 
 
@@ -94,18 +91,17 @@ def _expand_v2(r: Dict[str, Any]) -> List[Dict[str, Any]]:
 
             tr = (tblock.get("train") or {})
             va = (tblock.get("val") or {})
+
+            tr_perm = tr.get("permutation", {})
+            va_perm = va.get("permutation", {})
+
             row = dict(base)
             row.update({
                 "top_k": K,
                 "reuse_threshold": P,
-                "reuse_percent": tblock.get("reuse_percent"),
                 "shared_circuit_size": tblock.get("shared_circuit_size"),
-                "ablation_train_accuracy": tr.get("ablation_accuracy"),
-                "control_train_accuracy": tr.get("control_accuracy"),
-                "ablation_val_accuracy": va.get("ablation_accuracy"),
-                "control_val_accuracy": va.get("control_accuracy"),
-                "knockout_diff_train": tr.get("knockout_diff"),
-                "knockout_diff_val": va.get("knockout_diff"),
+                "perm_p_value_train": tr_perm.get("p_value"),
+                "perm_p_value_val": va_perm.get("p_value"),
             })
             rows.append(row)
 
@@ -143,35 +139,13 @@ def to_display(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def compute_lift(df: pd.DataFrame, split: str) -> pd.Series:
-    b = df[f"baseline_{split}_accuracy"].astype(float)
-    a = df[f"ablation_{split}_accuracy"].astype(float)
-    c = df[f"control_{split}_accuracy"].astype(float)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        lift = (a - c) / b
-
-    return pd.to_numeric(lift).replace([np.inf, -np.inf], np.nan)
-
-
-def compute_reuse(df: pd.DataFrame, percent: bool, top_k_col="top_k") -> pd.Series:
-    if "reuse_percent" in df.columns and df["reuse_percent"].notna().any():
-        val = df["reuse_percent"].astype(float)
-        return val if percent else (val / 100.0)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        frac = (df["shared_circuit_size"].astype(float) / df[top_k_col].astype(float))
-
-    return (frac * 100.0) if percent else frac
-
-
 def _subplot_grid(n: int) -> Tuple[int, int]:
     rows = max(1, (n + 2) // 3)
     cols = min(3, n)
     return rows, cols
 
 
-def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: bool, show: bool):
+def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, show: bool):
     df_k = df_k[~df_k["task"].isin(SKIP_TASKS)]
 
     ps_sorted = sorted(df_k["reuse_threshold"].dropna().unique().tolist())
@@ -202,7 +176,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         "constrained_layout": False,
         "squeeze": False,
     }
-    bbox_to_anchor = (0.5, -0.1)
+    bbox_to_anchor = (0.5, -0.3)
 
     if len(tasks) == 1:
         shared_plot_params["figsize"] = (14, 6)
@@ -252,7 +226,6 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         if sub_m.empty:
             continue
 
-        sub_m["lift"] = compute_lift(sub_m, split=split)
         rows, cols = _subplot_grid(len(tasks))
         fig, axes = plt.subplots(rows, cols, **shared_plot_params)
         fig.subplots_adjust(wspace=0.1, hspace=0.3)
@@ -260,22 +233,22 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         for idx, task in enumerate(tasks):
             ax = axes[idx // cols][idx % cols]
             dd = sub_m[sub_m["task_display"] == task]
-            if task == "Colored Objects MCQA":
-                task = "CopyColors MCQA"
-
+            
+            p_value_col = f"perm_p_value_{split}"
+            
             metric_map: Dict[Tuple[str, int], float] = {}
             for _, row in dd.iterrows():
-                metric_map[(row["model_display"], int(row["reuse_threshold"]))] = row["lift"]
+                metric_map[(row["model_display"], int(row["reuse_threshold"]))] = row[p_value_col]
 
             _plot_bars(
                 ax,
                 metric_map,
-                ylabel="Lift",
-                ylim=(-1.0, 0.5),
+                ylabel="p-value",
+                ylim=(0.0, 1.05),
                 show_ylabel=(idx % cols == 0),
                 show_xlabel=(idx // cols == rows - 1),
             )
-            ax.axhline(0.0, color="gray", linewidth=1, linestyle="--", alpha=0.7)
+            ax.axhline(0.05, color="red", linewidth=1.5, linestyle="--", alpha=0.9)
             ax.set_title(task, fontsize=FONT_SIZES["title"], pad=20)
 
         for k in range(len(tasks), rows * cols):
@@ -285,45 +258,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=bbox_to_anchor, fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
 
         k_val = int(df_k["top_k"].iloc[0])
-        outp = out_dir / f"multiplot_lift_k{k_val}_{safe_filename(method.lower())}_{split}.png"
-        outp.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(outp, dpi=200, bbox_inches="tight")
-        print(f"[INFO] Saved plot to {outp}")
-
-        if show:
-            plt.show()
-        plt.close(fig)
-
-        sub_m["reuse_metric"] = compute_reuse(sub_m, percent=percent)
-        fig, axes = plt.subplots(rows, cols, **shared_plot_params)
-        fig.subplots_adjust(wspace=0.1, hspace=0.3)
-
-        for idx, task in enumerate(tasks):
-            ax = axes[idx // cols][idx % cols]
-            dd = sub_m[sub_m["task_display"] == task]
-            if task == "Colored Objects MCQA":
-                task = "CopyColors MCQA"
-            metric_map: Dict[Tuple[str, int], float] = {}
-            for _, row in dd.iterrows():
-                metric_map[(row["model_display"], int(row["reuse_threshold"]))] = row["reuse_metric"]
-
-            _plot_bars(
-                ax,
-                metric_map,
-                ylabel="Reuse (%)" if percent else "Reuse (frac)",
-                ylim=(0, 100 if percent else 1),
-                show_ylabel=(idx % cols == 0),
-                show_xlabel=(idx // cols == rows - 1),
-            )
-            ax.set_title(task, fontsize=FONT_SIZES["title"], pad=20)
-
-        for k in range(len(tasks), rows * cols):
-            fig.delaxes(axes[k // cols][k % cols])
-
-        handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
-        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=bbox_to_anchor, fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
-
-        outp = out_dir / f"multiplot_reuse_k{k_val}_{safe_filename(method.lower())}.png"
+        outp = out_dir / f"multiplot_pvalue_k{k_val}_{safe_filename(method.lower())}_{split}.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(outp, dpi=200, bbox_inches="tight")
         print(f"[INFO] Saved plot to {outp}")
@@ -378,7 +313,6 @@ def main():
                 df_k.sort_values(["task_display", "hf_revision_step", "method_display", "reuse_threshold"]),
                 out_dir_split,
                 split=split,
-                percent=args.percent,
                 show=args.show
             )
 
