@@ -81,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Use autocast (mixed precision) during extraction.")
     parser.add_argument("--val-fraction", type=float, default=0.2, help="Holdout fraction for validation.")
     parser.add_argument("--perm-trials", type=int, default=5000, help="Trials for paired permutation test between shared vs control ablations.")
+    parser.add_argument("--ignore-type", action="store_true", help="Ignore component types when sampling.")
     return parser.parse_args()
 
 
@@ -159,15 +160,25 @@ def _sample_control_components(
     all_components: List[Component],
     rng: random.Random,
     parity: bool = False,
+    ignore_type: bool = False,
 ) -> List[Component]:
     """
-    Sample a control set with the same number of attention heads and MLPs
-    as the shared circuit. Sampling is without replacement within each type.
-    If parity is True, shared components are included in the sampling pool.
-    If parity is False, shared components are excluded from the sampling pool.
+    Sample a control set with the same number of components as the shared circuit.
+    Sampling is without replacement. If `parity` is True, shared components are included
+    in the sampling pool. If `ignore_type` is True, components are sampled randomly
+    from the full set, irrespective of type (heads or MLPs).
     """
     if not shared:
         return []
+
+    # Count the total number of components in the shared circuit
+    n_shared = len(shared)
+
+    if ignore_type:
+        # Sample randomly from the full set of components
+        pool = all_components if parity else [c for c in all_components if c not in shared]
+        n_to_sample = min(n_shared, len(pool))
+        return rng.sample(pool, n_to_sample)
 
     # Count how many of each type are in the shared circuit
     n_shared_heads = sum(1 for c in shared if c.kind == "head")
@@ -291,7 +302,7 @@ def _run_single_combination(
             # Evaluate ablations and collect per-example correctness for permutation tests
             rng_seed = int(hashlib.md5(f"{combo_key_root}|K{K}|p{thr}".encode("utf-8")).hexdigest()[:8], 16)
             rng = random.Random(rng_seed)
-            control_removed = _sample_control_components(shared, all_components, rng) if shared_size > 0 else []
+            control_removed = _sample_control_components(shared, all_components, rng, ignore_type=args.ignore_type) if shared_size > 0 else []
 
             if shared_size > 0:
                 ablation_train_correct, ablation_train_total, ablation_train_preds = evaluate_predictions(
