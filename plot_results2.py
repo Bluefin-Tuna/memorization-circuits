@@ -20,10 +20,11 @@ from circuit_reuse.dataset import get_task_display_name, get_model_display_name
 METHOD_DISPLAY = {"eap": "EAP", "gradient": "Gradient"}
 
 SKIP_TASKS = ["arc_easy"]
+# SKIP_TASKS = ["arc_easy", "arc_challenge", "mmlu", "addition"]
 
-def _extract_step_from_revision(rev: str) -> Optional[str]:
+def _extract_step_from_revision(rev: str) -> Optional[int]:
     m = re.search(r"(?:^|[-_])step(\d+)(?:$|[-_])", str(rev) if rev is not None else "")
-    return f"step{m.group(1)}" if m else None
+    return int(m.group(1)) if m else None
 
 
 def _model_display_with_revision(row: pd.Series) -> str:
@@ -32,7 +33,7 @@ def _model_display_with_revision(row: pd.Series) -> str:
     if pd.isna(rev) or rev is None or str(rev) == "":
         return base
     step = _extract_step_from_revision(str(rev))
-    return f"{base} {step}" if step else base
+    return f"step{step}" if step is not None else base
 
 
 def safe_filename(name: str) -> str:
@@ -134,7 +135,8 @@ def to_display(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if "task" in df.columns:
         df["task_display"] = df["task"].apply(get_task_display_name)
-
+    
+    df["hf_revision_step"] = df["hf_revision"].apply(_extract_step_from_revision)
     df["model_display"] = df.apply(_model_display_with_revision, axis=1)
     df["method_display"] = df.get("method", pd.Series(dtype=str)).map(METHOD_DISPLAY).fillna(
         df.get("method", pd.Series(dtype=str)).str.title()
@@ -175,11 +177,11 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
 
     ps_sorted = sorted(df_k["reuse_threshold"].dropna().unique().tolist())
     norm = Normalize(vmin=min(ps_sorted), vmax=max(ps_sorted))
-    cmap = plt.get_cmap("rocket")
+    cmap = plt.get_cmap("viridis")
     colors = {p: cmap(norm(p)) for p in ps_sorted}
 
     tasks = sorted(df_k["task_display"].dropna().unique().tolist())
-    models = sorted(df_k["model_display"].dropna().unique().tolist())
+    models = df_k.sort_values(by="hf_revision_step", ascending=True)["model_display"].dropna().unique().tolist()
     methods = sorted(df_k["method_display"].dropna().unique().tolist())
     
     FONT_SIZES = {
@@ -191,10 +193,16 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
     }
 
     shared_plot_params = {
-        "figsize": (3.5 * len(tasks), 2.0 * len(models)),
+        "figsize": (5.0 * len(tasks), 2.0 * len(models)),
         "constrained_layout": False,
         "squeeze": False,
     }
+    bbox_to_anchor = (0.5, -0.2)
+
+    if len(tasks) == 1:
+        shared_plot_params["figsize"] = (14, 6)
+        bbox_to_anchor = (0.5, -0.5)
+
     shared_ticklabel_params = {"rotation": 30, "ha": "right", "fontsize": FONT_SIZES["tick"]}
     shared_grid_params = {"axis": "y", "linestyle": "-", "alpha": 0.8}
 
@@ -231,7 +239,6 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         else:
             ax.tick_params(axis="y", labelleft=False)
 
-
         ax.grid(**shared_grid_params)
         ax.set_ylim(*ylim)
 
@@ -248,6 +255,9 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         for idx, task in enumerate(tasks):
             ax = axes[idx // cols][idx % cols]
             dd = sub_m[sub_m["task_display"] == task]
+            if task == "Colored Objects MCQA":
+                task = "CopyColors MCQA"
+
             metric_map: Dict[Tuple[str, int], float] = {}
             for _, row in dd.iterrows():
                 metric_map[(row["model_display"], int(row["reuse_threshold"]))] = row["lift"]
@@ -267,7 +277,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
             fig.delaxes(axes[k // cols][k % cols])
 
         handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
-        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=(0.5, -0.2), fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
+        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=bbox_to_anchor, fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
 
         k_val = int(df_k["top_k"].iloc[0])
         outp = out_dir / f"multiplot_lift_k{k_val}_{safe_filename(method.lower())}_{split}.png"
@@ -304,7 +314,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
             fig.delaxes(axes[k // cols][k % cols])
 
         handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
-        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=(0.5, -0.2), fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
+        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=bbox_to_anchor, fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
 
         outp = out_dir / f"multiplot_reuse_k{k_val}_{safe_filename(method.lower())}.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
@@ -346,7 +356,7 @@ def main():
                 continue
 
             _multiplot_for_k(
-                df_k.sort_values(["task_display", "model_display", "method_display", "reuse_threshold"]),
+                df_k.sort_values(["task_display", "hf_revision_step", "method_display", "reuse_threshold"]),
                 out_dir_split,
                 split=split,
                 percent=args.percent,
