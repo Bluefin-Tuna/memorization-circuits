@@ -173,6 +173,7 @@ def _subplot_grid(n: int) -> Tuple[int, int]:
 
 def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: bool, show: bool):
     df_k = df_k[~df_k["task"].isin(SKIP_TASKS)]
+    k_val = int(df_k["top_k"].iloc[0])
 
     ps_sorted = sorted(df_k["reuse_threshold"].dropna().unique().tolist())
     norm = Normalize(vmin=min(ps_sorted), vmax=max(ps_sorted))
@@ -191,10 +192,15 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
     
     FONT_SIZES = {
         "title": 36,
-        "suptitle": 32,
+        "suptitle": 40,
         "label": 32,
         "tick": 24,
         "legend_title": 26,
+    }
+
+    TITLE_PARAMS = {
+        "title_y": 1,
+        "title_weight": "bold"
     }
 
     shared_plot_params = {
@@ -256,6 +262,12 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         rows, cols = _subplot_grid(len(tasks))
         fig, axes = plt.subplots(rows, cols, **shared_plot_params)
         fig.subplots_adjust(wspace=0.1, hspace=0.3)
+        fig.suptitle(
+            f"Top-K={k_val}",
+            fontsize=FONT_SIZES["suptitle"],
+            y=TITLE_PARAMS["title_y"],
+            weight=TITLE_PARAMS["title_weight"]
+        )
 
         for idx, task in enumerate(tasks):
             ax = axes[idx // cols][idx % cols]
@@ -284,7 +296,6 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
         fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=bbox_to_anchor, fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
 
-        k_val = int(df_k["top_k"].iloc[0])
         outp = out_dir / f"multiplot_lift_k{k_val}_{safe_filename(method.lower())}_{split}.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(outp, dpi=200, bbox_inches="tight")
@@ -297,6 +308,12 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         sub_m["reuse_metric"] = compute_reuse(sub_m, percent=percent)
         fig, axes = plt.subplots(rows, cols, **shared_plot_params)
         fig.subplots_adjust(wspace=0.1, hspace=0.3)
+        fig.suptitle(
+            f"Top-K={k_val}",
+            fontsize=FONT_SIZES["suptitle"],
+            y=TITLE_PARAMS["title_y"],
+            weight=TITLE_PARAMS["title_weight"]
+        )
 
         for idx, task in enumerate(tasks):
             ax = axes[idx // cols][idx % cols]
