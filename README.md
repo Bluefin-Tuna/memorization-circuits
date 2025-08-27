@@ -1,18 +1,24 @@
 # Circuit Reuse Experiments
 
-This repo measures per-example circuits and shared reuse across examples, then ablates the shared circuit vs a size-matched random control to assess causal importance.
+This code measures per-example circuits and shared reuse across examples, then ablates the shared circuit vs various control methods to assess causal importance.
 
 High-level flow:
 
 1. Generate a dataset of prompt/target pairs for a task.
 2. Attribute component importance (attention heads / MLPs) per example.
 3. For each top-K and reuse threshold p, build a shared circuit from components present in at least p% of example circuits.
-4. Ablate the shared vs a size-matched random control; measure accuracy drop and permutation significance.
+4. Ablate the shared circuit vs control circuits; measure accuracy drop and permutation significance.
+
+We implement several control methods:
+
+- Size-matched random control (default): Random sampling excluding shared components, preserving head/MLP ratios
+- Type-ignoring control (`--ignore-type`): Random sampling from all components regardless of type
+- Parity control: Random sampling including shared components in the pool
 
 Outputs are saved per run into a folder with:
 
-- metrics.json – aggregated metrics by top-K and threshold
-- attributions_train.jsonl – per-example ranked components and scores
+- `metrics.json` – aggregated metrics by top-K and threshold
+- `attributions_train.jsonl` – per-example ranked components and scores
 
 ## Quick start
 
@@ -47,6 +53,14 @@ This writes:
 - --top_k_list: Comma-separated per-example top-K values (e.g., "5,10,25,50").
 - --reuse-thresholds: Comma-separated thresholds p as percentages (e.g., "95,96,97,98,99,100").
 - --perm-trials: Trials for paired permutation tests between shared vs control ablations.
+- --ignore-type: Use type-ignoring control (sample randomly regardless of head/MLP type).
+
+## Plotting utilities
+
+- `plot_results.py`: Basic accuracy and lift bar charts by task and model
+- `plot_results2.py`: Multi-panel plots showing reuse metrics and lift across thresholds
+- `plot_results3.py`: LaTeX tables of Ablation Impact Ratio over pretraining steps
+- `plot_results4.py`: Permutation test p-value visualizations
 
 ## Notes
 
