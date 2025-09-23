@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         "--top_k_list",
         type=str,
         required=True,
-        help="Comma-separated list of per-example top-K values to evaluate (e.g., '5,10,25,50').",
+        help="Comma-separated list of per-example top-K values as percentages to evaluate (e.g., '5,10' for top-5%, top-10%).",
     )
     parser.add_argument(
         "--reuse-thresholds",
@@ -135,12 +135,13 @@ def _save_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def _build_topk_example_sets(per_example_scores: List[Dict[Component, float]], k: int) -> List[set]:
+    total_components = len(per_example_scores[0])
+    take_components = max(1, int(total_components * k / 100))
     sets: List[set] = []
     for sc in per_example_scores:
         ranked = sorted(sc.items(), key=lambda x: x[1], reverse=True)
-        sets.append({c for c, _ in ranked[:k]})
+        sets.append({c for c, _ in ranked[:take_components]})
     return sets
-
 
 def _count_components(example_sets: List[set]) -> Dict[Component, int]:
     counts: Dict[Component, int] = {}
@@ -227,8 +228,9 @@ def _run_single_combination(
     if debug:
         print(f"[SPLIT] total={n} train={len(train_examples)} val={len(val_examples)} (val_fraction={vf:.2f})")
 
-    # Compute full per-example attribution scores once (keep all), we will slice to top-K later
-    extractor = CircuitExtractor(model, top_k=None, method=method)
+    # Compute the per-example attribution scores for all train examples over all components.
+    # These will be reused for all K and thresholds.
+    extractor = CircuitExtractor(model, method=method)
 
     combo_key_root = f"{model_name}|{hf_revision or 'none'}|{task}|{method}|n{num_examples}|d{digits}"
     start = time.time()
@@ -270,7 +272,7 @@ def _run_single_combination(
         "top_k_list": list(sorted(set(int(k) for k in top_k_list))),
         "reuse_thresholds": list(sorted(set(int(p) for p in reuse_thresholds))),
         "val_fraction": vf,
-    "perm_trials": int(perm_trials),
+        "perm_trials": int(perm_trials),
         "extraction_seconds": end - start,
         "baseline_train_accuracy": baseline_train_acc,
         "baseline_train_correct": baseline_train_correct,
@@ -452,7 +454,6 @@ def main() -> None:
             perm_trials=args.perm_trials,
             ignore_type=args.ignore_type
         )
-
     except Exception as e:
         print(f"[FATAL] {e}")
         import traceback

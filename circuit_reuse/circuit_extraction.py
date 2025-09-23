@@ -28,15 +28,9 @@ class Component:
 class CircuitExtractor:
     """
     Extract per-example attribution scores for components.
-
-    Note on semantics:
-      - top_k controls how many components we keep per-example (for the old pipeline).
-        For the new "circuit identifiability score" pipeline, set top_k=None to keep
-        all scored components per example and decide the shared K separately downstream.
     """
-    def __init__(self, model: HookedTransformer, top_k: Optional[int] = None, method: str = "eap") -> None:
+    def __init__(self, model: HookedTransformer, method: str = "eap") -> None:
         self.model = model
-        self.top_k = top_k
         self.method = method
         self.graph = Graph.from_model(model)
         # Enable hooks needed for all methods
@@ -52,6 +46,7 @@ class CircuitExtractor:
         return metric
 
     def _scores_to_components(self, scores: torch.Tensor) -> Dict[Component, float]:
+        """Convert raw scores to a mapping from Component to score. """
         from .graph import InputNode, MLPNode, AttentionNode
         component_scores: Dict[Component, float] = {}
         per_component_scores = scores.abs().sum(dim=1)
@@ -72,6 +67,15 @@ class CircuitExtractor:
         return component_scores
 
     def _prepare_eap_inputs(self, example: Example):
+        """Prepare inputs for the EAP (Edge Attribution Patching) method.
+        
+        EAP requires both clean and corrupted token sequences, as well as
+        a metric function which computes the loss on the target tokens.
+        
+        Target tokens are defined as the tokens in the clean sequence that come 
+        after the prompt, excluding any common prefix with the prompt.
+        """
+        # Tokenize inputs
         prompt_tok = self.model.to_tokens(example.prompt, prepend_bos=True)
         clean_full_tok = self.model.to_tokens(example.prompt + example.target, prepend_bos=True)
         corrupted_full_tok = self.model.to_tokens(example.corrupted_prompt + example.corrupted_target, prepend_bos=True)
@@ -79,14 +83,17 @@ class CircuitExtractor:
         device = self.model.cfg.device
         p_ids, f_ids = prompt_tok.tolist()[0], clean_full_tok.tolist()[0]
         lcp = 0
+        # Find the longest common prefix between prompt and full clean tokens
         while lcp < len(p_ids) and lcp < len(f_ids) and p_ids[lcp] == f_ids[lcp]:
             lcp += 1
 
+        # Find target token IDs (those after the prompt, excluding common prefix)
         gold_ids_list = f_ids[lcp:] if lcp < len(f_ids) else self.model.to_tokens(example.target, prepend_bos=False).tolist()[0]
         target_ids = torch.tensor(gold_ids_list, device=device, dtype=torch.long)
         prompt_len = prompt_tok.shape[1]
         positions = torch.arange(prompt_len - 1, prompt_len - 1 + len(gold_ids_list), device=device, dtype=torch.long)
 
+        # Add padding to both sequences
         max_len = max(clean_full_tok.shape[1], corrupted_full_tok.shape[1])
         pad_token = self.model.tokenizer.pad_token_id if self.model.tokenizer.pad_token_id is not None else self.model.tokenizer.eos_token_id
 
@@ -97,6 +104,11 @@ class CircuitExtractor:
         return clean_tokens, corrupted_tokens, metric, max_len
 
     def _prepare_gradient_inputs(self, example: Example):
+        """Prepare inputs for gradient-based methods.
+        
+        Gradient methods require only the clean token sequence and a metric function.
+        Target tokens are defined the same as above.
+        """
         prompt_tok = self.model.to_tokens(example.prompt, prepend_bos=True)
         clean_full_tok = self.model.to_tokens(example.prompt + example.target, prepend_bos=True)
 
@@ -214,7 +226,7 @@ class CircuitExtractor:
             component_scores = self._scores_to_components(scores)
             per_example_scores.append(component_scores)
             items = sorted(component_scores.items(), key=lambda x: x[1], reverse=True)
-            comp_set = {c for c, _ in (items[:self.top_k] if self.top_k is not None else items)}
+            comp_set = {c for c, _ in items}
             circuits.append(comp_set)
 
             if (idx + 1) % 10 == 0 or (idx + 1) == len(examples):
