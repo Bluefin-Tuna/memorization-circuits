@@ -208,7 +208,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         "constrained_layout": False,
         "squeeze": False,
     }
-    bbox_to_anchor = (0.5, -0.1)
+    bbox_to_anchor = (0.5, -0.2)
 
     if len(tasks) == 1:
         shared_plot_params["figsize"] = (14, 6)
@@ -294,7 +294,15 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
             fig.delaxes(axes[k // cols][k % cols])
 
         handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
-        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=bbox_to_anchor, fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
+        fig.legend(
+            handles=handles,
+            title="reuse@p",
+            loc="lower center",
+            bbox_to_anchor=bbox_to_anchor,
+            fontsize=FONT_SIZES["tick"],
+            title_fontsize=FONT_SIZES["legend_title"],
+            ncol=len(ps_sorted)
+        )
 
         outp = out_dir / f"multiplot_lift_k{k_val}_{safe_filename(method.lower())}_{split}.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
@@ -338,7 +346,15 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
             fig.delaxes(axes[k // cols][k % cols])
 
         handles = [Patch(facecolor=colors[p], edgecolor="black", label=str(p)) for p in ps_sorted]
-        fig.legend(handles=handles, title="reuse@p", loc="lower center", bbox_to_anchor=bbox_to_anchor, fontsize=FONT_SIZES["tick"], title_fontsize=FONT_SIZES["legend_title"], ncol=len(ps_sorted))
+        fig.legend(
+            handles=handles, 
+            title="reuse@p",
+            loc="lower center",
+            bbox_to_anchor=bbox_to_anchor,
+            fontsize=FONT_SIZES["tick"],
+            title_fontsize=FONT_SIZES["legend_title"],
+            ncol=len(ps_sorted)
+        )
 
         outp = out_dir / f"multiplot_reuse_k{k_val}_{safe_filename(method.lower())}.png"
         outp.parent.mkdir(parents=True, exist_ok=True)
