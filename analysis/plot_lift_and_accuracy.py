@@ -42,7 +42,6 @@ def safe_filename(name: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-
     p.add_argument("--results-dir", type=str, default="results")
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--save-csv-name", type=str, default="aggregated_metrics.csv")

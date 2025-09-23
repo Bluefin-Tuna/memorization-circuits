@@ -3,7 +3,7 @@ import argparse
 import json
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
@@ -384,7 +384,7 @@ def main():
     if available_reuse_ps:
         df = df[df["reuse_threshold"].isin(available_reuse_ps)]
 
-    out_dir = Path(args.output_dir) if args.output_dir else results_dir / f"plots_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = Path(args.output_dir) if args.output_dir else results_dir / f"plots_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for split in ["train", "val"]:
