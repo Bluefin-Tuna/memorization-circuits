@@ -192,7 +192,6 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
     
     FONT_SIZES = {
         "title": 36,
-        "suptitle": 40,
         "label": 32,
         "tick": 24,
         "legend_title": 26,
@@ -245,7 +244,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         ax.tick_params(axis="y", labelsize=20)
 
         if show_ylabel:
-            ax.set_ylabel(ylabel, fontsize=36)
+            ax.set_ylabel(ylabel, fontsize=20)
             ax.tick_params(axis="y", labelsize=FONT_SIZES["tick"])
         else:
             ax.tick_params(axis="y", labelleft=False)
@@ -262,12 +261,6 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         rows, cols = _subplot_grid(len(tasks))
         fig, axes = plt.subplots(rows, cols, **shared_plot_params)
         fig.subplots_adjust(wspace=0.1, hspace=0.3)
-        fig.suptitle(
-            f"Top-K={k_val}",
-            fontsize=FONT_SIZES["suptitle"],
-            y=TITLE_PARAMS["title_y"],
-            weight=TITLE_PARAMS["title_weight"]
-        )
 
         for idx, task in enumerate(tasks):
             ax = axes[idx // cols][idx % cols]
@@ -282,7 +275,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
             _plot_bars(
                 ax,
                 metric_map,
-                ylabel="Lift",
+                ylabel=f"Lift at Top-{k_val} Components",
                 ylim=(-1.0, 0.5),
                 show_ylabel=(idx % cols == 0),
                 show_xlabel=(idx // cols == rows - 1),
@@ -316,12 +309,6 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
         sub_m["reuse_metric"] = compute_reuse(sub_m, percent=percent)
         fig, axes = plt.subplots(rows, cols, **shared_plot_params)
         fig.subplots_adjust(wspace=0.1, hspace=0.3)
-        fig.suptitle(
-            f"Top-K={k_val}",
-            fontsize=FONT_SIZES["suptitle"],
-            y=TITLE_PARAMS["title_y"],
-            weight=TITLE_PARAMS["title_weight"]
-        )
 
         for idx, task in enumerate(tasks):
             ax = axes[idx // cols][idx % cols]
@@ -335,7 +322,7 @@ def _multiplot_for_k(df_k: pd.DataFrame, out_dir: Path, *, split: str, percent: 
             _plot_bars(
                 ax,
                 metric_map,
-                ylabel="Reuse (%)" if percent else "Reuse (frac)",
+                ylabel=f"% of Top-{k_val} Components Reused" if percent else f"Fraction of Top-{k_val} Components Reused",
                 ylim=(0, 100 if percent else 1),
                 show_ylabel=(idx % cols == 0),
                 show_xlabel=(idx // cols == rows - 1),

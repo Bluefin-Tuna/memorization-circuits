@@ -25,7 +25,7 @@ def _extract_step_from_revision(rev: str) -> Optional[str]:
 
 def _model_display_with_revision(row: pd.Series) -> str:
     base = get_model_display_name(row.get("model_name"))
-    rev = row.get("hf_revision", None)
+    rev = row.get("hf_revision", Nonek)
 
     if pd.isna(rev) or rev is None or str(rev) == "":
         return base
