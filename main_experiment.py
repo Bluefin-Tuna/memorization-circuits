@@ -1,17 +1,16 @@
 import argparse
 import time
-from typing import List, Dict, Any, Tuple, Iterable
 import json
 import math
 from pathlib import Path
-from datetime import datetime
-from contextlib import nullcontext
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Tuple, Iterable
 import random
 import hashlib
 
 import torch
-from models.olmo_adapter import load_model_any
 
+from models.olmo_adapter import load_model_any
 from circuit_reuse.dataset import get_dataset, Example
 from circuit_reuse.circuit_extraction import (
     CircuitExtractor,
@@ -19,13 +18,12 @@ from circuit_reuse.circuit_extraction import (
 )
 from circuit_reuse.evaluate import (
     evaluate_accuracy,
-    evaluate_accuracy_with_ablation,
     evaluate_predictions,
 )
 
 
 def _default_run_name():
-    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def _prepare_run_dir(output_dir: str, run_name: str | None):
@@ -49,13 +47,22 @@ def _parse_int_list(s: str | None) -> List[int]:
         return []
     if isinstance(s, list):  # already parsed
         return [int(x) for x in s]
-    return [int(x.strip()) for x in str(s).replace(";", ",").split(",") if x is not None and str(x).strip() != ""]
+    return [
+        int(x.strip())
+        for x in str(s).replace(";", ",").split(",") 
+        if x is not None and str(x).strip() != ""
+    ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Circuit reuse experiment (single-run) with reuse@p metrics and saved artifacts.")
     parser.add_argument("--model_name", type=str, required=True, help="Model name.")
-    parser.add_argument("--hf-revision", type=str, default=None, help="HF revision tag or commit (e.g., some-step-tag).")
+    parser.add_argument(
+        "--hf-revision",
+        type=str,
+        default=None,
+        help="HF revision tag or commit (e.g., some-step-tag)."
+    )
     parser.add_argument("--task", type=str, required=True, help="Task name.")
     parser.add_argument("--num_examples", type=int, required=True, help="Number of examples to generate/use.")
     parser.add_argument("--digits", type=int, default=None, help="Digit count (only for addition).")
@@ -80,15 +87,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-mem", action="store_true", help="Print CUDA memory after the run.")
     parser.add_argument("--amp", action="store_true", help="Use autocast (mixed precision) during extraction.")
     parser.add_argument("--val-fraction", type=float, default=0.2, help="Holdout fraction for validation.")
-    parser.add_argument("--perm-trials", type=int, default=5000, help="Trials for paired permutation test between shared vs control ablations.")
-    parser.add_argument("--ignore-type", action="store_true", help="Ignore component types when sampling.")
+    parser.add_argument(
+        "--perm-trials",
+        type=int,
+        default=5000,
+        help="Trials for paired permutation test between shared vs control ablations."
+    )
+    parser.add_argument(
+        "--ignore-type",
+        action="store_true",
+        help="Ignore component types when sampling."
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default="cache",
+        help="Directory for caching per-example attribution scores. Created if missing.",
+    )
+    parser.add_argument(
+        "--analysis",
+        action="store_true",
+        help="Analysis-only mode: skips extraction, expects cached scores to be available.",
+    )
+    parser.add_argument(
+        "--force-extract",
+        action="store_true",
+        help="Force re-extraction of attributions even if cached scores exist.",
+    )
     return parser.parse_args()
 
 
-def _enumerate_all_components(model) -> List[Component]:
+def _enumerate_all_components(model):
     n_layers = model.cfg.n_layers
     n_heads = model.cfg.n_heads
-    comps: List[Component] = []
+    comps = []
     for layer in range(n_layers):
         for h in range(n_heads):
             comps.append(Component(layer=layer, kind="head", index=h))
@@ -96,20 +128,17 @@ def _enumerate_all_components(model) -> List[Component]:
     return comps
 
 
-def _permutation_test(shared_flags: List[int], control_flags: List[int], trials: int = 5000, rng: random.Random | None = None) -> Dict[str, Any]:
-    """
-    shared_flags/control_flags are 0/1 correct indicators aligned per example.
+def _permutation_test(shared_flags: List[int], control_flags: List[int], rng: random.Random, trials: int = 5000) -> Dict[str, Any]:
+    """Perform a paired permutation test between shared and control correctness flags.
 
-    Ccomputes the observed difference in means: diff = mean(control) - mean(shared).
-    Under the null, we swap each paired observation and recompute the diff.
-    P-value is the fraction of permuted diffs whose absolute value >= |observed|.
+    Returns a dictionary with the observed difference and p-value.  This is
+    identical to the original implementation.
     """
     assert len(shared_flags) == len(control_flags)
     n = len(shared_flags)
     if n == 0:
         return {"p_value": 1.0, "obs_diff": 0.0, "trials": 0}
 
-    rng = rng or random.Random(12345)
     obs = (sum(control_flags) / n) - (sum(shared_flags) / n)
 
     exceed = 0
@@ -128,23 +157,19 @@ def _permutation_test(shared_flags: List[int], control_flags: List[int], trials:
     return {"p_value": float(p), "obs_diff": float(obs), "trials": int(trials)}
 
 
-def _save_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
-    with path.open("w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
-
-
 def _build_topk_example_sets(per_example_scores: List[Dict[Component, float]], k: int) -> List[set]:
+    """Build sets of the top-k% components for each example."""
     total_components = len(per_example_scores[0])
     take_components = max(1, int(total_components * k / 100))
-    sets: List[set] = []
+    sets = []
     for sc in per_example_scores:
         ranked = sorted(sc.items(), key=lambda x: x[1], reverse=True)
         sets.append({c for c, _ in ranked[:take_components]})
     return sets
 
+
 def _count_components(example_sets: List[set]) -> Dict[Component, int]:
-    counts: Dict[Component, int] = {}
+    counts = {}
     for s in example_sets:
         for c in s:
             counts[c] = counts.get(c, 0) + 1
@@ -163,10 +188,9 @@ def _sample_control_components(
     parity: bool = False,
     ignore_type: bool = False,
 ) -> List[Component]:
-    """
-    Sample a control set with the same number of components as the shared circuit.
-    Sampling is without replacement. If `parity` is True, shared components are included
-    in the sampling pool. If `ignore_type` is True, components are sampled randomly
+    """Sample a control set with the same number of components as the shared circuit.
+    Sampling is without replacement. If parity is True, shared components are included
+    in the sampling pool. If ignore_type is True, components are sampled randomly
     from the full set, irrespective of type (heads or MLPs).
     """
     if not shared:
@@ -193,29 +217,84 @@ def _sample_control_components(
         head_pool = [c for c in all_components if c.kind == "head" and c not in shared]
         mlp_pool = [c for c in all_components if c.kind == "mlp" and c not in shared]
 
-    # Guard against impossible requests (shouldn't happen under normal configs)
-    n_heads_to_sample = min(n_shared_heads, len(head_pool))
-    n_mlps_to_sample = min(n_shared_mlps, len(mlp_pool))
+    if n_shared_heads > len(head_pool):
+        raise ValueError(f"Insufficient head components in pool: need {n_shared_heads}, have {len(head_pool)}")
+    if n_shared_mlps > len(mlp_pool):
+        raise ValueError(f"Insufficient MLP components in pool: need {n_shared_mlps}, have {len(mlp_pool)}")
 
-    sampled: List[Component] = []
-    if n_heads_to_sample > 0:
-        sampled.extend(rng.sample(head_pool, n_heads_to_sample))
-    if n_mlps_to_sample > 0:
-        sampled.extend(rng.sample(mlp_pool, n_mlps_to_sample))
+    sampled = []
+    if n_shared_heads > 0:
+        sampled.extend(rng.sample(head_pool, n_shared_heads))
+    if n_shared_mlps > 0:
+        sampled.extend(rng.sample(mlp_pool, n_shared_mlps))
 
     return sampled
 
 
+def _load_cached_attributions(path: Path) -> List[Dict[Component, float]]:
+    example_scores = []
+    with path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            comp_scores: Dict[Component, float] = {}
+            for comp in data.get("components", []):
+                comp_obj = Component(
+                    layer=int(comp["layer"]),
+                    kind=str(comp["kind"]),
+                    index=int(comp["index"]),
+                )
+                comp_scores[comp_obj] = float(comp.get("score", 0.0))
+            example_scores.append(comp_scores)
+    return example_scores
+
+
+def _save_attributions_to_cache(path: Path, example_scores: List[Dict[Component, float]]):
+    with path.open("w") as f:
+        for i, sc in enumerate(example_scores):
+            ranked = sorted(sc.items(), key=lambda x: x[1], reverse=True)
+            row = {
+                "index": i,
+                "components": [
+                    {
+                        "layer": c.layer,
+                        "kind": c.kind,
+                        "index": c.index,
+                        "score": float(score)
+                    }
+                    for (c, score) in ranked
+                ],
+            }
+            f.write(json.dumps(row) + "\n")
+
+
 def _run_single_combination(
-    model, model_name: str, task: str, num_examples: int, digits: int | None,
-    top_k_list: List[int], reuse_thresholds: List[int], device: str, debug: bool, run_dir: Path, amp: bool,
-    val_fraction: float, method: str, hf_revision: str | None, perm_trials: int,
-    ignore_type: bool
+    model,
+    model_name: str,
+    task: str,
+    num_examples: int,
+    digits: int | None,
+    top_k_list: List[int],
+    reuse_thresholds: List[int],
+    device: str,
+    debug: bool,
+    run_dir: Path,
+    amp: bool,
+    val_fraction: float,
+    method: str,
+    hf_revision: str | None,
+    perm_trials: int,
+    ignore_type: bool,
+    cache_dir: Path,
+    analysis: bool,
+    force_extract: bool,
 ):
     dataset = get_dataset(task, num_examples=num_examples, digits=digits if digits is not None else 0)
     print(f"[{model_name}/{task}] Generated {len(dataset)} examples for method '{method}'.")
-
-    # Extract attributions for training examples only
+        
+    # Split into train/val
     examples = list(dataset)
     random.shuffle(examples)
     n = len(examples)
@@ -228,27 +307,58 @@ def _run_single_combination(
     if debug:
         print(f"[SPLIT] total={n} train={len(train_examples)} val={len(val_examples)} (val_fraction={vf:.2f})")
 
-    # Compute the per-example attribution scores for all train examples over all components.
-    # These will be reused for all K and thresholds.
-    extractor = CircuitExtractor(model, method=method)
+    # Check for cached attributions
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    digits_str = str(digits) if (digits is not None and task == "addition") else "na"
+    attrib_name = (
+        f"{model_name.replace('/', '_')}__{hf_revision or 'none'}__{task}__{method}__"
+        f"n{num_examples}__d{digits_str}.jsonl"
+    )
+    attrib_path = cache_dir / attrib_name
 
-    combo_key_root = f"{model_name}|{hf_revision or 'none'}|{task}|{method}|n{num_examples}|d{digits}"
-    start = time.time()
-
-    example_sets_all: List[set] = []
-    example_scores: List[Dict[Component, float]] = []
-    try:
-        example_sets_all, example_scores = extractor.extract_circuits_from_examples(
-            examples=train_examples,
-            task_name=task,
-            amp=amp,
-            device=device,
-        )
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"[OOM] Skipping attribution for {combo_key_root}: {e}")
-    except Exception as e:
-        print(f"[ERROR] Circuit extraction failed for {combo_key_root}: {e}")
-    end = time.time()
+    # Decide whether to load from cache or extract anew
+    if not force_extract and attrib_path.exists():
+        # Load cached scores
+        try:
+            example_scores = _load_cached_attributions(attrib_path)
+            if debug:
+                print(f"[CACHE] Loaded cached attributions from {attrib_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load cached attributions from {attrib_path}: {e}") from e
+    else:
+        if analysis:
+            # Analysis mode expects the cache to exist, so raise an error if missing
+            if not attrib_path.exists():
+                raise FileNotFoundError(
+                    f"Analysis mode specified but cache file {attrib_path} is missing. "
+                    f"Run without --analysis or with --force-extract to generate it."
+                )
+            # Otherwise load from cache as above (force_extract overrides analysis)
+            example_scores = _load_cached_attributions(attrib_path)
+            if debug:
+                print(f"[CACHE] Loaded cached attributions from {attrib_path}")
+        else:
+            # Perform extraction
+            extractor = CircuitExtractor(model, method=method)
+            combo_key_root = f"{model_name}|{hf_revision or 'none'}|{task}|{method}|n{num_examples}|d{digits}"
+            start = time.time()
+            try:
+                _, example_scores = extractor.extract_circuits_from_examples(
+                    examples=train_examples,
+                    task_name=task,
+                    amp=amp,
+                    device=device,
+                )
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"[OOM] Skipping attribution for {combo_key_root}: {e}")
+            except Exception as e:
+                print(f"[ERROR] Circuit extraction failed for {combo_key_root}: {e}")
+                raise
+            end = time.time()
+            # Save to cache
+            _save_attributions_to_cache(attrib_path, example_scores)
+            if debug:
+                print(f"[CACHE] Saved attributions to {attrib_path} (extraction_seconds={end - start:.2f}s)")
 
     # Evaluate baseline once
     baseline_train_correct, baseline_train_total = evaluate_accuracy(model, train_examples, task=task, verbose=debug)
@@ -259,6 +369,10 @@ def _run_single_combination(
     else:
         baseline_val_correct = baseline_val_total = 0
         baseline_val_acc = float("nan")
+
+    extraction_seconds = None
+    if not analysis and end and start:
+        extraction_seconds = end - start
 
     # Prepare metrics structure
     metrics: Dict[str, Any] = {
@@ -273,7 +387,7 @@ def _run_single_combination(
         "reuse_thresholds": list(sorted(set(int(p) for p in reuse_thresholds))),
         "val_fraction": vf,
         "perm_trials": int(perm_trials),
-        "extraction_seconds": end - start,
+        "extraction_seconds": extraction_seconds,
         "baseline_train_accuracy": baseline_train_acc,
         "baseline_train_correct": baseline_train_correct,
         "baseline_train_total": baseline_train_total,
@@ -293,7 +407,7 @@ def _run_single_combination(
         counts = _count_components(sets_k)
         n_ex = len(sets_k)
 
-        per_thresh: Dict[str, Any] = {}
+        per_thresh = {}
         for p in metrics["reuse_thresholds"]:
             thr = max(0, min(100, int(p)))
             need = int(math.ceil(thr / 100.0 * n_ex))
@@ -349,12 +463,22 @@ def _run_single_combination(
             # Permutation tests (paired) for train/val
             shared_flags_train = [1 if r.get("is_correct") else 0 for r in ablation_train_preds]
             control_flags_train = [1 if r.get("is_correct") else 0 for r in control_train_preds]
-            perm_train = _permutation_test(shared_flags_train, control_flags_train, trials=int(perm_trials), rng=random.Random(rng_seed + 1)) if len(shared_flags_train) == len(control_flags_train) else {"p_value": 1.0, "obs_diff": 0.0, "trials": 0}
+            perm_train = _permutation_test(
+                shared_flags_train,
+                control_flags_train,
+                trials=int(perm_trials),
+                rng=random.Random(rng_seed + 1)
+            ) if len(shared_flags_train) == len(control_flags_train) else {"p_value": 1.0, "obs_diff": 0.0, "trials": 0}
 
             if val_examples:
                 shared_flags_val = [1 if r.get("is_correct") else 0 for r in ablation_val_preds]
                 control_flags_val = [1 if r.get("is_correct") else 0 for r in control_val_preds]
-                perm_val = _permutation_test(shared_flags_val, control_flags_val, trials=int(perm_trials), rng=random.Random(rng_seed + 2)) if len(shared_flags_val) == len(control_flags_val) else {"p_value": 1.0, "obs_diff": 0.0, "trials": 0}
+                perm_val = _permutation_test(
+                    shared_flags_val,
+                    control_flags_val,
+                    trials=int(perm_trials),
+                    rng=random.Random(rng_seed + 2)
+                ) if len(shared_flags_val) == len(control_flags_val) else {"p_value": 1.0, "obs_diff": 0.0, "trials": 0}
             else:
                 perm_val = {"p_value": float("nan"), "obs_diff": float("nan"), "trials": 0}
 
@@ -383,48 +507,45 @@ def _run_single_combination(
             }
             per_thresh[str(thr)] = thresh_entry
 
-        metrics["by_k"][str(K)] = {
-            "thresholds": per_thresh,
-        }
+        metrics["by_k"][str(K)] = {"thresholds": per_thresh}
 
+    # Create output directory and write metrics
     combo_dir = run_dir
     combo_dir.mkdir(parents=True, exist_ok=True)
 
     with (combo_dir / "metrics.json").open("w") as f:
         json.dump(metrics, f, indent=2, sort_keys=True)
     print(f"[METRICS] {combo_dir/'metrics.json'}")
-
-    # Save per-example attribution rankings once
-    attrib_rows = []
-    for i, sc in enumerate(example_scores):
-        ranked = sorted(sc.items(), key=lambda x: x[1], reverse=True)
-        attrib_rows.append({
-            "index": i,
-            "components": [
-                {"layer": c.layer, "kind": c.kind, "index": c.index, "score": float(score)}
-                for (c, score) in ranked
-            ],
-        })
-    _save_jsonl(combo_dir / "attributions_train.jsonl", attrib_rows)
-    print(f"[ARTIFACT] attributions_train.jsonl saved.")
-
     print(f"[DONE] {combo_dir}")
 
 
-def main() -> None:
+def main():
     args = parse_args()
     base_run_dir = _prepare_run_dir(args.output_dir, args.run_name)
     if args.log_mem:
         print(f"Model: {args.model_name}, Task: {args.task}")
 
+    model = None
     try:
         print(f"[MODEL LOAD] Loading model {args.model_name} (dtype={args.dtype}) on {args.device}...")
-        dtype_map = {"bf16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        dtype_map = {
+            "bf16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32
+        }
         torch_dtype = None if args.dtype == "auto" else dtype_map[args.dtype]
-        model = load_model_any(args.model_name, device=args.device, torch_dtype=torch_dtype, revision=args.hf_revision)
+        model = load_model_any(
+            args.model_name,
+            device=args.device,
+            torch_dtype=torch_dtype,
+            revision=args.hf_revision
+        )
         model.eval()
         if args.log_mem and torch.cuda.is_available():
-            print(f"[MEM] post-load allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB")
+            print(
+                f"[MEM] post-load allocated={torch.cuda.memory_allocated()/1e9:.2f}GiB "
+                f"reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB"
+            )
 
         digits = args.digits if args.task == "addition" else None
         top_k_list = _parse_int_list(args.top_k_list)
@@ -452,7 +573,10 @@ def main() -> None:
             method=args.method,
             hf_revision=args.hf_revision,
             perm_trials=args.perm_trials,
-            ignore_type=args.ignore_type
+            ignore_type=args.ignore_type,
+            cache_dir=Path(args.cache_dir),
+            analysis=args.analysis,
+            force_extract=args.force_extract,
         )
     except Exception as e:
         print(f"[FATAL] {e}")
