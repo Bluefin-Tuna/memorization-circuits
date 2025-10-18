@@ -6,16 +6,22 @@ from PIL import Image
 from .dataset import VLMExample
 
 
-def _normalise_answer(ans: str) -> str:
+def _normalise_answer(ans):
     return ans.strip().lower()
 
 
-def _extract_answer(text: str) -> str:
-    # Match curly braces first
-    m = re.search(r"\{([^\}]+)\}", text)
-    if m:
-        return m.group(1)
-    # Fall back to first non-empty word
+def _extract_answer(text):
+    if "assistant\n" in text:
+        text = text.split("assistant\n", 1)[1]
+    
+    square_matches = re.findall(r"\[([^\]]+)\]", text)
+    if square_matches:
+        return square_matches[-1]
+    
+    curly_matches = re.findall(r"\{([^\}]+)\}", text)
+    if curly_matches:
+        return curly_matches[-1]
+    
     parts = text.split()
     return parts[0] if parts else ""
 
@@ -33,10 +39,8 @@ def evaluate_dataset(
     total_errors = 0
     details = []
 
-    # Helper to build model inputs; handles chat templates for multi-modal chat models (e.g., Qwen2-VL)
     def build_inputs(ex: VLMExample):
         img_or_path = ex.image if ex.image is not None else ex.image_path
-        # Use chat template if available to insert image placeholders into input_ids
         if hasattr(processor, "apply_chat_template"):
             messages = [
                 {
@@ -52,7 +56,6 @@ def evaluate_dataset(
             )
             inputs = processor(text=[text], images=[img_or_path], return_tensors="pt", padding=True)
         else:
-            # Fallback: direct processor call with images + text
             sig = processor.__call__.__code__.co_varnames
             image_key = "images" if "images" in sig else "pixel_values"
             inputs = processor(

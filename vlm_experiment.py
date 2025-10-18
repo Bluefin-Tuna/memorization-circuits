@@ -29,7 +29,11 @@ def _parse_args():
     p.add_argument("--dtype", type=str, default=None, choices=["float16", "float32", "bfloat16", "auto"], help="Model dtype.")
     p.add_argument("--revision", type=str, default=None, help="Model revision or tag.")
     p.add_argument("--output-dir", type=str, default="results", help="Directory to save metrics and plots.")
-    p.add_argument("--run-circuit", action="store_true", help="Perform causal tracing over cross-attention modules.")
+    p.add_argument("--run-circuit", action="store_true", help="Perform causal tracing over modules.")
+    p.add_argument("--run-heads", action="store_true", help="Perform head-level analysis.")
+    p.add_argument("--run-ablation", action="store_true", help="Perform ablation experiments on top heads.")
+    p.add_argument("--top-k-heads", type=int, default=10, help="Number of top heads to analyze/ablate.")
+    p.add_argument("--held-out-domain", type=str, default=None, help="Held-out domain for ablation generalization test.")
     p.add_argument(
         "--pair-file",
         type=str,
@@ -42,6 +46,7 @@ def _parse_args():
         action="store_true",
         help="Analysis-only mode: generate plots from existing JSON results instead of running experiments.",
     )
+    p.add_argument("--target-layers", type=str, default="early", help="Which layers to target: 'early', 'all', or comma-separated indices.")
     return p.parse_args()
 
 
@@ -52,6 +57,8 @@ def _run_analysis(output_dir: Path):
     "*__module_effects.json" files, aggregates summary metrics across
     models/domains, and emits plots alongside the JSON files.
     """
+    from vlm_analysis.plotting import plot_head_importance, plot_ablation_impact
+    
     metrics_entries = []
     # Collect metrics across all runs
     for metrics_path in output_dir.glob("*__metrics.json"):
@@ -82,12 +89,66 @@ def _run_analysis(output_dir: Path):
         try:
             with effects_path.open("r") as f:
                 effects = json.load(f)
+            if not effects:
+                print(f"[ANALYSIS] Skipped {effects_path}: empty results (no modules matched filter)")
+                continue
             # Derive a PNG path next to the JSON
             out_png = effects_path.with_suffix(".png")
             plot_module_heatmap(effects, str(out_png))
             print(f"[ANALYSIS] Wrote module effects heatmap -> {out_png}")
         except Exception as e:
             print(f"[ANALYSIS] Skipped {effects_path}: {e}")
+    
+    # Plot head importance from head effects files
+    for head_effects_path in output_dir.glob("*__head_effects.json"):
+        try:
+            with head_effects_path.open("r") as f:
+                head_effects = json.load(f)
+            if not head_effects:
+                print(f"[ANALYSIS] Skipped {head_effects_path}: empty results")
+                continue
+            
+            # Convert to list of (name, score) tuples sorted by score
+            head_scores = []
+            for key_str, score in head_effects.items():
+                # Parse the key which is stored as string like "('module.name', 0)"
+                head_scores.append((key_str, score))
+            head_scores.sort(key=lambda x: abs(x[1]), reverse=True)
+            
+            out_png = head_effects_path.with_suffix(".png")
+            plot_head_importance(head_scores[:20], str(out_png))  # Top 20 heads
+            print(f"[ANALYSIS] Wrote head importance plot -> {out_png}")
+        except Exception as e:
+            print(f"[ANALYSIS] Skipped {head_effects_path}: {e}")
+    
+    # Plot ablation impact from ablation results files
+    for ablation_path in output_dir.glob("*__ablation_results.json"):
+        try:
+            with ablation_path.open("r") as f:
+                ablation_data = json.load(f)
+            if not ablation_data:
+                print(f"[ANALYSIS] Skipped {ablation_path}: empty results")
+                continue
+            
+            # Format: {"baseline": {...}, "ablated_in_domain": {...}, "ablated_held_out": {...}}
+            ablation_metrics = {}
+            if "baseline" in ablation_data and "ablated_in_domain" in ablation_data:
+                ablation_metrics["In-domain"] = {
+                    "baer_before": ablation_data["baseline"].get("baer", 0.0),
+                    "baer_after": ablation_data["ablated_in_domain"].get("baer", 0.0),
+                }
+            if "ablated_held_out" in ablation_data:
+                ablation_metrics["Held-out"] = {
+                    "baer_before": ablation_data.get("baseline_held_out", {}).get("baer", 0.0),
+                    "baer_after": ablation_data["ablated_held_out"].get("baer", 0.0),
+                }
+            
+            if ablation_metrics:
+                out_png = ablation_path.with_suffix(".png")
+                plot_ablation_impact(ablation_metrics, str(out_png))
+                print(f"[ANALYSIS] Wrote ablation impact plot -> {out_png}")
+        except Exception as e:
+            print(f"[ANALYSIS] Skipped {ablation_path}: {e}")
 
 
 def _load_pairs(pair_file: Path, examples: list[VLMExample]):
@@ -113,6 +174,15 @@ def main():
     # Validate required args for experiment mode
     if not args.model_name:
         raise SystemExit("--model-name is required when not running with --analysis")
+    
+    # Parse target layers
+    target_layers = args.target_layers
+    if target_layers not in ["early", "all"]:
+        try:
+            target_layers = [int(x) for x in target_layers.split(",")]
+        except ValueError:
+            raise SystemExit(f"Invalid --target-layers: {args.target_layers}")
+    
     # Load dataset
     examples = load_vlmbias(
         split=args.split,
@@ -120,6 +190,17 @@ def main():
         return_images=True,
         num_examples=args.num_examples,
     )
+    
+    # Load held-out domain if specified
+    held_out_examples = None
+    if args.held_out_domain:
+        held_out_examples = load_vlmbias(
+            split=args.split,
+            domain=args.held_out_domain,
+            return_images=True,
+            num_examples=args.num_examples,
+        )
+    
     # Load model and processor
     model, processor = load_vlm_model(
         args.model_name,
@@ -127,6 +208,14 @@ def main():
         dtype=args.dtype,
         revision=args.revision,
     )
+    
+    # Prepare output path
+    out_root = Path(args.output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    domain_str = args.domain or "all"
+    model_sanitised = args.model_name.replace("/", "_")
+    base_fname = f"{model_sanitised}__{domain_str}"
+    
     # Baseline evaluation
     baseline_results = evaluate_dataset(
         model,
@@ -134,12 +223,7 @@ def main():
         examples,
         max_new_tokens=args.max_new_tokens,
     )
-    # Prepare output path
-    out_root = Path(args.output_dir)
-    out_root.mkdir(parents=True, exist_ok=True)
-    domain_str = args.domain or "all"
-    model_sanitised = args.model_name.replace("/", "_")
-    base_fname = f"{model_sanitised}__{domain_str}"
+    
     metrics_path = out_root / f"{base_fname}__metrics.json"
     with metrics_path.open("w") as f:
         json.dump(
@@ -153,17 +237,133 @@ def main():
             f,
             indent=2,
         )
+    print(f"[BASELINE] Accuracy: {baseline_results['accuracy']:.3f}, BAER: {baseline_results['baer']:.3f}")
+    
     # Run circuit analysis if requested
     if args.run_circuit:
+        print("[CIRCUIT] Running module-level causal tracing...")
         pair_file = Path(args.pair_file)
         pairs = _load_pairs(pair_file, examples)
-        analyzer = CircuitAnalyzer(model, processor, max_new_tokens=args.max_new_tokens)
+        analyzer = CircuitAnalyzer(
+            model, processor, 
+            max_new_tokens=args.max_new_tokens,
+            target_layers=target_layers
+        )
+        print(f"[CIRCUIT] Analyzing {len(analyzer.modules)} modules across {len(pairs)} pairs...")
         mod_effects = analyzer.analyze_dataset(pairs)
         effects_path = out_root / f"{base_fname}__module_effects.json"
         with effects_path.open("w") as f:
             json.dump(mod_effects, f, indent=2)
+        print(f"[CIRCUIT] Module effects written to {effects_path}")
+        
+        # Show top modules
+        sorted_effects = sorted(mod_effects.items(), key=lambda x: abs(x[1]), reverse=True)
+        print("[CIRCUIT] Top 5 modules by absolute effect:")
+        for name, eff in sorted_effects[:5]:
+            print(f"  {name}: {eff:.4f}")
+    
+    # Run head-level analysis if requested
+    if args.run_heads:
+        print("[HEADS] Running head-level analysis...")
+        pair_file = Path(args.pair_file)
+        pairs = _load_pairs(pair_file, examples)
+        analyzer = CircuitAnalyzer(
+            model, processor,
+            max_new_tokens=args.max_new_tokens,
+            target_layers=target_layers
+        )
+        head_effects = analyzer.analyze_heads(pairs)
+        
+        # Convert tuple keys to strings for JSON serialization
+        head_effects_serializable = {
+            f"{module}__head_{head}": effect
+            for (module, head), effect in head_effects.items()
+        }
+        
+        head_effects_path = out_root / f"{base_fname}__head_effects.json"
+        with head_effects_path.open("w") as f:
+            json.dump(head_effects_serializable, f, indent=2)
+        print(f"[HEADS] Head effects written to {head_effects_path}")
+        
+        # Show top heads
+        sorted_heads = sorted(head_effects.items(), key=lambda x: abs(x[1]), reverse=True)
+        print(f"[HEADS] Top {min(10, len(sorted_heads))} heads by absolute effect:")
+        for (module, head), eff in sorted_heads[:10]:
+            layer_num = module.split("layers.")[1].split(".")[0] if "layers." in module else "?"
+            print(f"  Layer {layer_num}, Head {head}: {eff:.4f}")
+    
+    # Run ablation experiments if requested
+    if args.run_ablation:
+        print("[ABLATION] Running ablation experiments...")
+        
+        # Load head effects to determine which heads to ablate
+        head_effects_path = out_root / f"{base_fname}__head_effects.json"
+        if not head_effects_path.exists():
+            print("[ABLATION] No head effects file found. Run with --run-heads first.")
+            return
+        
+        with head_effects_path.open("r") as f:
+            head_effects_data = json.load(f)
+        
+        # Parse head effects and get top K
+        head_effects = []
+        for key, effect in head_effects_data.items():
+            # Parse "module__head_N" format
+            parts = key.rsplit("__head_", 1)
+            if len(parts) == 2:
+                module, head_str = parts
+                try:
+                    head = int(head_str)
+                    head_effects.append(((module, head), effect))
+                except ValueError:
+                    continue
+        
+        head_effects.sort(key=lambda x: abs(x[1]), reverse=True)
+        top_heads = [head for head, _ in head_effects[:args.top_k_heads]]
+        
+        print(f"[ABLATION] Ablating top {len(top_heads)} heads...")
+        for module, head in top_heads[:5]:
+            layer = module.split("layers.")[1].split(".")[0] if "layers." in module else "?"
+            print(f"  Layer {layer}, Head {head}")
+        
+        analyzer = CircuitAnalyzer(
+            model, processor,
+            max_new_tokens=args.max_new_tokens,
+            target_layers=target_layers
+        )
+        
+        # Ablate on in-domain examples
+        ablated_in_domain = analyzer.ablate_heads(examples, top_heads)
+        print(f"[ABLATION] In-domain - Baseline BAER: {baseline_results['baer']:.3f}, Ablated BAER: {ablated_in_domain['baer']:.3f}")
+        print(f"[ABLATION] In-domain - BAER reduction: {(baseline_results['baer'] - ablated_in_domain['baer']):.3f}")
+        
+        ablation_results = {
+            "top_k": args.top_k_heads,
+            "heads_ablated": [{"module": m, "head": h} for m, h in top_heads],
+            "baseline": baseline_results,
+            "ablated_in_domain": ablated_in_domain,
+        }
+        
+        # Ablate on held-out domain if provided
+        if held_out_examples:
+            print(f"[ABLATION] Testing on held-out domain: {args.held_out_domain}")
+            baseline_held_out = evaluate_dataset(
+                model, processor, held_out_examples,
+                max_new_tokens=args.max_new_tokens
+            )
+            ablated_held_out = analyzer.ablate_heads(held_out_examples, top_heads)
+            print(f"[ABLATION] Held-out - Baseline BAER: {baseline_held_out['baer']:.3f}, Ablated BAER: {ablated_held_out['baer']:.3f}")
+            print(f"[ABLATION] Held-out - BAER reduction: {(baseline_held_out['baer'] - ablated_held_out['baer']):.3f}")
+            
+            ablation_results["baseline_held_out"] = baseline_held_out
+            ablation_results["ablated_held_out"] = ablated_held_out
+        
+        ablation_path = out_root / f"{base_fname}__ablation_results.json"
+        with ablation_path.open("w") as f:
+            json.dump(ablation_results, f, indent=2)
+        print(f"[ABLATION] Results written to {ablation_path}")
 
-    print(f"[DONE] Results written to {metrics_path}")
+    print(f"[DONE] All results written to {out_root}")
 
 
 if __name__ == "__main__":
