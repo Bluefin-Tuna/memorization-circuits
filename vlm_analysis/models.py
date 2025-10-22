@@ -47,6 +47,13 @@ def load_vlm_model(
 
     processor = AutoProcessor.from_pretrained(model_name, revision=revision)
 
+    # Set padding side to left for decoder-only models (required for correct generation)
+    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        processor.tokenizer.padding_side = "left"
+    # Some processors have tokenizer as a direct attribute
+    if hasattr(processor, "padding_side"):
+        processor.padding_side = "left"
+
     # Prefer modern multi-modal class when supported; else fallback
     try:
         if hasattr(processor, "image_processor"):
