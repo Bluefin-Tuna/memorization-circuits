@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# Set HuggingFace cache to network volume
+export HF_HOME="/workspace/huggingface"
+export TRANSFORMERS_CACHE="/workspace/huggingface/hub"
+export HF_DATASETS_CACHE="/workspace/huggingface/datasets"
+
+# Create cache directories if they don't exist
+mkdir -p "$HF_HOME"
+mkdir -p "$TRANSFORMERS_CACHE"
+mkdir -p "$HF_DATASETS_CACHE"
+
 # Array of models to evaluate
 MODELS=(
     "meta-llama/Llama-3.2-11B-Vision"
@@ -24,8 +34,9 @@ NUM_PAIRS=100
 TOP_K_HEADS=20
 TARGET_LAYERS="early"
 MAX_NEW_TOKENS=10
-DEVICE="cuda"  # Change to "cuda" if running on GPU locally
-DTYPE="bfloat16"  # Change to "bfloat16" if using GPU
+DEVICE="cuda"
+DTYPE="bfloat16"
+LOAD_IN_8BIT="true"  # Use 8-bit quantization to save memory
 
 # Accept optional model index argument for running single model
 MODEL_INDEX=${1:-}
@@ -77,6 +88,7 @@ run_model_experiment() {
                 --num-examples "$NUM_EXAMPLES" \
                 --device "$DEVICE" \
                 --dtype "$DTYPE" \
+                --load-in-8bit \
                 --max-new-tokens "$MAX_NEW_TOKENS" \
                 --run-full-pipeline \
                 --num-pairs "$NUM_PAIRS" \
@@ -93,6 +105,7 @@ run_model_experiment() {
                 --num-examples "$NUM_EXAMPLES" \
                 --device "$DEVICE" \
                 --dtype "$DTYPE" \
+                --load-in-8bit \
                 --max-new-tokens "$MAX_NEW_TOKENS" \
                 --run-full-pipeline \
                 --num-pairs "$NUM_PAIRS" \
@@ -128,6 +141,46 @@ run_model_experiment() {
     echo "=========================================="
     echo "Model Complete: $MODEL"
     echo "=========================================="
+
+    # Clean up model cache to save disk space
+    echo ""
+    echo "Cleaning up model cache for $MODEL..."
+    python3 -c "
+import shutil
+from pathlib import Path
+import os
+
+# HuggingFace cache directory (using network volume)
+cache_dir = Path('/workspace/huggingface/hub')
+
+if cache_dir.exists():
+    model_name = '$MODEL'
+    # Convert model name to cache format (e.g., 'Qwen/Qwen3-VL-4B' -> 'models--Qwen--Qwen3-VL-4B')
+    cache_name = 'models--' + model_name.replace('/', '--')
+
+    # Find and remove all matching cache directories
+    removed_size = 0
+    for item in cache_dir.iterdir():
+        if cache_name in item.name:
+            try:
+                # Get size before deletion
+                if item.is_dir():
+                    size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                    removed_size += size
+                    shutil.rmtree(item)
+                    print(f'Removed: {item.name} ({size / 1024**3:.2f} GB)')
+            except Exception as e:
+                print(f'Warning: Could not remove {item.name}: {e}')
+
+    if removed_size > 0:
+        print(f'Total space freed: {removed_size / 1024**3:.2f} GB')
+    else:
+        print(f'No cache found for {model_name}')
+else:
+    print('HuggingFace cache directory not found')
+" || echo "[WARNING] Model cleanup failed, continuing..."
+
+    echo "[DONE] Model cleanup complete"
 }
 
 # Run experiments

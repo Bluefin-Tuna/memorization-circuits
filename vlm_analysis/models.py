@@ -17,6 +17,7 @@ def load_vlm_model(
     *,
     dtype: Optional[str] = None,
     revision: Optional[str] = None,
+    load_in_8bit: bool = False,
 ):
     # Resolve device: if CUDA requested but unavailable, fallback to CPU
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -31,6 +32,19 @@ def load_vlm_model(
         }
         torch_dtype = dtype_map[dtype]
 
+    # 8-bit quantization config
+    load_kwargs = {
+        "revision": revision,
+        "torch_dtype": torch_dtype,
+    }
+
+    if load_in_8bit:
+        # Use device_map="auto" for 8-bit quantization
+        load_kwargs["load_in_8bit"] = True
+        load_kwargs["device_map"] = "auto"
+    else:
+        load_kwargs["device_map"] = None
+
     processor = AutoProcessor.from_pretrained(model_name, revision=revision)
 
     # Prefer modern multi-modal class when supported; else fallback
@@ -38,9 +52,7 @@ def load_vlm_model(
         if hasattr(processor, "image_processor"):
             model = AutoModelForImageTextToText.from_pretrained(
                 model_name,
-                revision=revision,
-                torch_dtype=torch_dtype,
-                device_map=None,
+                **load_kwargs,
             )
         else:
             raise ValueError("not multi-modal")
@@ -49,19 +61,17 @@ def load_vlm_model(
         if hasattr(processor, "image_processor"):
             model = AutoModelForVision2Seq.from_pretrained(
                 model_name,
-                revision=revision,
-                torch_dtype=torch_dtype,
-                device_map=None,
+                **load_kwargs,
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                revision=revision,
-                torch_dtype=torch_dtype,
-                device_map=None,
+                **load_kwargs,
             )
 
-    model = model.to(device)
+    # Only move to device if not using 8-bit (device_map handles it)
+    if not load_in_8bit:
+        model = model.to(device)
     model.eval()
     return model, processor
 

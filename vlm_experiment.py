@@ -27,6 +27,7 @@ def _parse_args():
     p.add_argument("--num-examples", type=int, default=None, help="Number of examples to evaluate (default: all).")
     p.add_argument("--device", type=str, default=None, help="Computation device (e.g., cuda, cpu). Default selects automatically.")
     p.add_argument("--dtype", type=str, default=None, choices=["float16", "float32", "bfloat16", "auto"], help="Model dtype.")
+    p.add_argument("--load-in-8bit", action="store_true", help="Load model in 8-bit precision to save memory.")
     p.add_argument("--revision", type=str, default=None, help="Model revision or tag.")
     p.add_argument("--output-dir", type=str, default="results", help="Directory to save metrics and plots.")
     p.add_argument("--run-circuit", action="store_true", help="Perform causal tracing over modules.")
@@ -345,6 +346,7 @@ def main():
         device=args.device or ("cuda" if torch.cuda.is_available() else "cpu"),
         dtype=args.dtype,
         revision=args.revision,
+        load_in_8bit=args.load_in_8bit,
     )
     
     # Prepare output path
