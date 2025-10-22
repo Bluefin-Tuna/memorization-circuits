@@ -67,28 +67,40 @@ run_model_experiment() {
 
         echo "Output Directory: $OUT_DIR"
 
-        # Determine if this is the held-out domain
-        HELD_OUT_ARG=""
-        if [ "$DOMAIN" != "$HELD_OUT_DOMAIN" ]; then
-            HELD_OUT_ARG="--held-out-domain $HELD_OUT_DOMAIN"
-        fi
-
         # Run full pipeline (baseline → circuit → heads → ablation)
-        python vlm_experiment.py \
-            --model-name "$MODEL" \
-            --split main \
-            --domain "$DOMAIN" \
-            --num-examples "$NUM_EXAMPLES" \
-            --device "$DEVICE" \
-            --dtype "$DTYPE" \
-            --max-new-tokens "$MAX_NEW_TOKENS" \
-            --run-full-pipeline \
-            --num-pairs "$NUM_PAIRS" \
-            --top-k-heads "$TOP_K_HEADS" \
-            --target-layers "$TARGET_LAYERS" \
-            $HELD_OUT_ARG \
-            --output-dir "$OUT_DIR" \
-        || { echo "[ERROR] Pipeline failed for $DOMAIN"; continue; }
+        # Build command with conditional held-out domain argument
+        if [ "$DOMAIN" != "$HELD_OUT_DOMAIN" ]; then
+            python vlm_experiment.py \
+                --model-name "$MODEL" \
+                --split main \
+                --domain "$DOMAIN" \
+                --num-examples "$NUM_EXAMPLES" \
+                --device "$DEVICE" \
+                --dtype "$DTYPE" \
+                --max-new-tokens "$MAX_NEW_TOKENS" \
+                --run-full-pipeline \
+                --num-pairs "$NUM_PAIRS" \
+                --top-k-heads "$TOP_K_HEADS" \
+                --target-layers "$TARGET_LAYERS" \
+                --held-out-domain "$HELD_OUT_DOMAIN" \
+                --output-dir "$OUT_DIR" \
+            || { echo "[ERROR] Pipeline failed for $DOMAIN"; continue; }
+        else
+            python vlm_experiment.py \
+                --model-name "$MODEL" \
+                --split main \
+                --domain "$DOMAIN" \
+                --num-examples "$NUM_EXAMPLES" \
+                --device "$DEVICE" \
+                --dtype "$DTYPE" \
+                --max-new-tokens "$MAX_NEW_TOKENS" \
+                --run-full-pipeline \
+                --num-pairs "$NUM_PAIRS" \
+                --top-k-heads "$TOP_K_HEADS" \
+                --target-layers "$TARGET_LAYERS" \
+                --output-dir "$OUT_DIR" \
+            || { echo "[ERROR] Pipeline failed for $DOMAIN"; continue; }
+        fi
 
         # Generate analysis for this domain
         echo ""
