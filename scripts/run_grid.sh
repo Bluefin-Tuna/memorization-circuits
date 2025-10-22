@@ -4,15 +4,21 @@ set -euo pipefail
 # Array of models to evaluate
 MODELS=(
     "meta-llama/Llama-3.2-11B-Vision"
-    "Qwen/Qwen2-VL-2B-Instruct"
-    "Qwen/Qwen2-VL-7B-Instruct"
-    "google/paligemma-3-mix-448"
-    "google/paligemma-3-mix-224"
+    "Qwen/Qwen3-VL-4B-Instruct"
+    "Qwen/Qwen3-VL-8B-Instruct"
+    "google/gemma-3-12b-it"
+    "google/gemma-3-4b-it"
 )
-
-# Configuration
-DOMAINS=("Logos" "Chess" "Board_Games" "Anime" "Fashion")
-HELD_OUT_DOMAIN="Chess"
+DOMAINS=(
+    "Animals"
+    "Logos"
+    "National Flags"
+    "Chess Pieces"
+    "Board Games"
+    "Optical Illusions"
+    "Patterned Grids"
+)
+HELD_OUT_DOMAIN="Chess Pieces"
 NUM_EXAMPLES=500
 NUM_PAIRS=100
 TOP_K_HEADS=20
@@ -53,9 +59,10 @@ run_model_experiment() {
         echo "Processing Domain: $DOMAIN"
         echo "=========================================="
 
-        # Output directory with timestamp - includes domain name
+        # Output directory with timestamp - includes domain name (spaces replaced with underscores)
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        OUT_DIR="results_full/$(echo $MODEL | tr '/' '_')_${DOMAIN}_${TIMESTAMP}"
+        DOMAIN_CLEAN=$(echo "$DOMAIN" | tr ' ' '_')
+        OUT_DIR="results_full/$(echo $MODEL | tr '/' '_')_${DOMAIN_CLEAN}_${TIMESTAMP}"
         mkdir -p "${OUT_DIR}"
 
         echo "Output Directory: $OUT_DIR"
