@@ -1,19 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# Set HuggingFace cache to network volume
-export HF_HOME="/workspace/huggingface"
-export TRANSFORMERS_CACHE="/workspace/huggingface/hub"
-export HF_DATASETS_CACHE="/workspace/huggingface/datasets"
-
-# Create cache directories if they don't exist
-mkdir -p "$HF_HOME"
-mkdir -p "$TRANSFORMERS_CACHE"
-mkdir -p "$HF_DATASETS_CACHE"
-
 # Array of models to evaluate
 MODELS=(
-    "meta-llama/Llama-3.2-11B-Vision"
     "Qwen/Qwen3-VL-4B-Instruct"
     "Qwen/Qwen3-VL-8B-Instruct"
     "google/gemma-3-12b-it"
@@ -71,9 +60,10 @@ run_model_experiment() {
         echo "=========================================="
 
         # Output directory with timestamp - includes domain name (spaces replaced with underscores)
+        # Save to network volume at /workspace
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
         DOMAIN_CLEAN=$(echo "$DOMAIN" | tr ' ' '_')
-        OUT_DIR="results_full/$(echo $MODEL | tr '/' '_')_${DOMAIN_CLEAN}_${TIMESTAMP}"
+        OUT_DIR="/workspace/results_full/$(echo $MODEL | tr '/' '_')_${DOMAIN_CLEAN}_${TIMESTAMP}"
         mkdir -p "${OUT_DIR}"
 
         echo "Output Directory: $OUT_DIR"
@@ -88,7 +78,6 @@ run_model_experiment() {
                 --num-examples "$NUM_EXAMPLES" \
                 --device "$DEVICE" \
                 --dtype "$DTYPE" \
-                --load-in-8bit \
                 --max-new-tokens "$MAX_NEW_TOKENS" \
                 --run-full-pipeline \
                 --num-pairs "$NUM_PAIRS" \
@@ -105,7 +94,6 @@ run_model_experiment() {
                 --num-examples "$NUM_EXAMPLES" \
                 --device "$DEVICE" \
                 --dtype "$DTYPE" \
-                --load-in-8bit \
                 --max-new-tokens "$MAX_NEW_TOKENS" \
                 --run-full-pipeline \
                 --num-pairs "$NUM_PAIRS" \
@@ -150,8 +138,8 @@ import shutil
 from pathlib import Path
 import os
 
-# HuggingFace cache directory (using network volume)
-cache_dir = Path('/workspace/huggingface/hub')
+# HuggingFace cache directory (default home directory)
+cache_dir = Path.home() / '.cache' / 'huggingface' / 'hub'
 
 if cache_dir.exists():
     model_name = '$MODEL'
