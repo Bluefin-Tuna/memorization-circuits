@@ -50,7 +50,7 @@ class CircuitAnalyzer:
 
     def _prepare_inputs(self, ex: VLMExample):
         img_or_path = ex.image if ex.image is not None else ex.image_path
-        if hasattr(self.processor, "apply_chat_template"):
+        if hasattr(self.processor, "apply_chat_template") and hasattr(self.processor, "chat_template") and self.processor.chat_template is not None:
             messages = [
                 {
                     "role": "user",

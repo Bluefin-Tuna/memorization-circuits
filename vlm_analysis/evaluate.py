@@ -41,7 +41,7 @@ def evaluate_dataset(
 
     def build_inputs(ex: VLMExample):
         img_or_path = ex.image if ex.image is not None else ex.image_path
-        if hasattr(processor, "apply_chat_template"):
+        if hasattr(processor, "apply_chat_template") and hasattr(processor, "chat_template") and processor.chat_template is not None:
             messages = [
                 {
                     "role": "user",
