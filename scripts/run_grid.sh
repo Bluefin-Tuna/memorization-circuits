@@ -21,14 +21,14 @@ MODELS=(
 DOMAINS=(
     "Animals"
     "Logos"
-    "National Flags"
-    "Chess Pieces"
-    "Board Games"
-    "Optical Illusions"
-    "Patterned Grids"
+    # "National Flags"
+    # "Chess Pieces"
+    # "Board Games"
+    # "Optical Illusions"
+    # "Patterned Grids"
 )
 HELD_OUT_DOMAIN="Chess Pieces"
-NUM_EXAMPLES=500
+NUM_EXAMPLES=100
 NUM_PAIRS=100
 TOP_K_HEADS=20
 TARGET_LAYERS="early"
