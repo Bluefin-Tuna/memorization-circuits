@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# Set HuggingFace cache to default home directory (explicit for clarity)
+export HF_HOME="$HOME/.cache/huggingface"
+export TRANSFORMERS_CACHE="$HOME/.cache/huggingface/hub"
+export HF_DATASETS_CACHE="$HOME/.cache/huggingface/datasets"
+
+# Create cache directories if they don't exist
+mkdir -p "$HF_HOME"
+mkdir -p "$TRANSFORMERS_CACHE"
+mkdir -p "$HF_DATASETS_CACHE"
+
 # Array of models to evaluate
 MODELS=(
     "Qwen/Qwen3-VL-4B-Instruct"
