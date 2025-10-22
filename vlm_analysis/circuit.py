@@ -50,19 +50,24 @@ class CircuitAnalyzer:
 
     def _prepare_inputs(self, ex: VLMExample):
         img_or_path = ex.image if ex.image is not None else ex.image_path
-        if hasattr(self.processor, "apply_chat_template") and hasattr(self.processor, "chat_template") and self.processor.chat_template is not None:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": img_or_path},
-                        {"type": "text", "text": ex.question},
-                    ],
-                }
-            ]
-            text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
-            inp = self.processor(text=[text], images=[img_or_path], return_tensors="pt", padding=True)
-        else:
+        # Try to use chat template if available
+        try:
+            if hasattr(self.processor, "apply_chat_template") and hasattr(self.processor, "chat_template") and self.processor.chat_template is not None:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img_or_path},
+                            {"type": "text", "text": ex.question},
+                        ],
+                    }
+                ]
+                text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+                inp = self.processor(text=[text], images=[img_or_path], return_tensors="pt", padding=True)
+            else:
+                raise AttributeError("No chat template")
+        except (ValueError, AttributeError, RuntimeError):
+            # Fallback for processors without chat template or if chat template fails
             sig = self.processor.__call__.__code__.co_varnames
             image_key = "images" if "images" in sig else "pixel_values"
             inp = self.processor(
